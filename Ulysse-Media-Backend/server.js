@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
@@ -10,6 +12,7 @@ const multer = require('multer');
 const mysql = require('mysql2/promise');
 const { parse } = require('csv-parse/sync');
 const { Server: SocketIOServer } = require('socket.io');
+const Stripe = require('stripe');
 
 const app = express();
 const server = http.createServer(app);
@@ -91,10 +94,17 @@ const MYSQL_PORT = Number(process.env.MYSQL_PORT || 3306);
 const MYSQL_USER = process.env.MYSQL_USER || 'root';
 const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || 'root';
 const MYSQL_DATABASE = process.env.MYSQL_DATABASE || 'UlysseMediaDB';
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 let db;
 
 app.use(cors());
+// Stripe webhook needs raw body — register before express.json()
+app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '5mb' }));
 app.use('/uploads', express.static(uploadsDir));
 
@@ -293,6 +303,8 @@ function mapQuoteRequestRow(row) {
     clientNotified: row.client_notified === null ? false : !!row.client_notified,
     clientSeen: row.client_seen === null ? false : !!row.client_seen,
     clientSeenAt: row.client_seen_at || null,
+    clientResponse: row.client_response || null,
+    depositPaid: !!row.deposit_paid,
     dateCreation: row.date_creation
   };
 }
@@ -1329,6 +1341,9 @@ app.patch('/api/quote-requests/:id/assign', auth, authorize('ADMIN'), async (req
     [selectedEmployee.id, mysqlNow(), assignmentAuto ? 1 : 0, 'AFFECTE', quoteRequest.id]
   );
 
+  // Mark employee as unavailable
+  await query('UPDATE users SET disponibilite = 0 WHERE id = ?', [selectedEmployee.id]);
+
   // Notify the assigned employee
   await createNotification(selectedEmployee.id, {
     type: 'devis',
@@ -1387,6 +1402,9 @@ app.patch('/api/quote-requests/:id/study', auth, authorize('EMPLOYE'), uploadFil
      WHERE id = ?`,
     [JSON.stringify(study), mysqlNow(), 'ETUDE_ENVOYEE', quoteRequest.id]
   );
+
+  // Mark employee as available again
+  await query('UPDATE users SET disponibilite = 1 WHERE id = ?', [req.user.id]);
 
   // Notify all admins
   try {
@@ -1447,6 +1465,276 @@ app.patch('/api/quote-requests/:id/final-estimation', auth, authorize('ADMIN'), 
 
   const updatedQuote = await findQuoteRequestById(quoteRequest.id);
   return res.json({ quoteRequest: updatedQuote });
+});
+
+// ── Client response (ACCEPTE / REFUSE) ───────────────────────────────────────
+app.patch('/api/quote-requests/:id/client-response', auth, authorize('CLIENT'), async (req, res) => {
+  const quoteRequest = await findQuoteRequestById(req.params.id);
+  if (!quoteRequest) return res.status(404).json({ message: 'Demande introuvable.' });
+  if (quoteRequest.clientId !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+  if (quoteRequest.statut !== 'REPONDU') return res.status(400).json({ message: 'La demande n\'a pas encore recu de reponse.' });
+  if (quoteRequest.clientResponse) return res.status(400).json({ message: 'Vous avez deja repondu a cette demande.' });
+
+  const { response } = req.body || {};
+  if (response !== 'ACCEPTE' && response !== 'REFUSE') return res.status(400).json({ message: 'response doit etre ACCEPTE ou REFUSE.' });
+
+  const newStatut = response === 'ACCEPTE' ? 'EN_ATTENTE_PAIEMENT' : 'REFUSE';
+  await query('UPDATE quote_requests SET client_response = ?, statut = ? WHERE id = ?', [response, newStatut, quoteRequest.id]);
+
+  // Notify admins
+  try {
+    const admins = await query('SELECT id FROM users WHERE role = ? AND suspended = 0', ['ADMIN']);
+    for (const admin of admins) {
+      await createNotification(admin.id, {
+        type: 'devis',
+        title: response === 'ACCEPTE' ? 'Devis accepte par le client' : 'Devis refuse par le client',
+        message: `Le client a ${response === 'ACCEPTE' ? 'accepte' : 'refuse'} le devis.`,
+        link: `/backoffice/devis/${quoteRequest.id}`
+      });
+    }
+  } catch (_) {}
+
+  const updatedQuote = await findQuoteRequestById(quoteRequest.id);
+  return res.json({ quoteRequest: updatedQuote });
+});
+
+// ── Client deposit payment via Stripe ────────────────────────────────────────
+app.post('/api/quote-requests/:id/pay-deposit', auth, authorize('CLIENT'), async (req, res) => {
+  const quoteRequest = await findQuoteRequestById(req.params.id);
+  if (!quoteRequest) return res.status(404).json({ message: 'Demande introuvable.' });
+  if (quoteRequest.clientId !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+  if (quoteRequest.statut !== 'EN_ATTENTE_PAIEMENT') return res.status(400).json({ message: 'Paiement non applicable pour ce statut.' });
+  if (quoteRequest.depositPaid) return res.status(400).json({ message: 'Depot deja paye.' });
+
+  const estimation = quoteRequest.finalEstimation;
+  if (!estimation || !estimation.amount) return res.status(400).json({ message: 'Aucune estimation disponible.' });
+
+  const depositAmount = Math.round(estimation.amount * 0.1 * 100); // cents
+
+  if (!stripe) {
+    return res.status(503).json({ message: 'Le paiement Stripe n\'est pas configure sur le serveur.' });
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    payment_method_types: ['card'],
+    mode: 'payment',
+    line_items: [{
+      price_data: {
+        currency: (estimation.currency || 'EUR').toLowerCase(),
+        product_data: {
+          name: `Acompte — ${quoteRequest.serviceType || 'Projet'}`,
+          description: `10% d'acompte pour votre projet Ulysse Media (Réf. ${quoteRequest.id.slice(0, 8)})`,
+        },
+        unit_amount: depositAmount,
+      },
+      quantity: 1,
+    }],
+    metadata: { quoteId: quoteRequest.id, type: 'deposit' },
+    success_url: `${FRONTEND_URL}/paiement/succes?session_id={CHECKOUT_SESSION_ID}&quoteId=${quoteRequest.id}`,
+    cancel_url: `${FRONTEND_URL}/mes-devis/${quoteRequest.id}`,
+  });
+
+  // Save pending payment
+  await query(
+    'INSERT INTO payments (id, quote_id, stripe_session_id, amount_cents, currency, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [createId('pay'), quoteRequest.id, session.id, depositAmount, (estimation.currency || 'EUR').toUpperCase(), 'PENDING', mysqlNow()]
+  );
+
+  return res.json({ checkoutUrl: session.url, sessionId: session.id });
+});
+
+// ── Stripe Webhook ─────────────────────────────────────────────────────────────
+app.post('/api/payments/webhook', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    if (STRIPE_WEBHOOK_SECRET && stripe) {
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } else {
+      event = JSON.parse(req.body.toString());
+    }
+  } catch (err) {
+    return res.status(400).json({ message: `Webhook Error: ${err.message}` });
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const { quoteId } = session.metadata || {};
+    if (quoteId) {
+      const quoteRequest = await findQuoteRequestById(quoteId);
+      if (quoteRequest && !quoteRequest.depositPaid) {
+        await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['PAID', session.id]);
+        await activateDepositAndOpenChat(quoteRequest);
+      }
+    }
+  }
+
+  if (event.type === 'checkout.session.expired' || event.type === 'payment_intent.payment_failed') {
+    const session = event.data.object;
+    await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['FAILED', session.id]).catch(() => {});
+  }
+
+  return res.json({ received: true });
+});
+
+// ── Get payment status ─────────────────────────────────────────────────────────
+app.get('/api/payments/verify', async (req, res) => {
+  const { session_id, quoteId } = req.query;
+  if (!session_id && !quoteId) return res.status(400).json({ message: 'session_id ou quoteId requis.' });
+
+  // Prioritize session_id verification to avoid false negatives right after checkout redirect.
+  if (session_id) {
+    const rows = await query('SELECT * FROM payments WHERE stripe_session_id = ? LIMIT 1', [session_id]);
+    const payment = rows[0];
+    if (!payment && stripe) {
+      try {
+        const session = await stripe.checkout.sessions.retrieve(session_id);
+        const quoteIdFromStripe = session?.metadata?.quoteId;
+        if (session?.payment_status === 'paid' && quoteIdFromStripe) {
+          const qr = await findQuoteRequestById(quoteIdFromStripe);
+          if (qr && !qr.depositPaid) {
+            await activateDepositAndOpenChat(qr);
+          }
+          return res.json({ paid: true, quoteId: quoteIdFromStripe });
+        }
+      } catch (_) {}
+      return res.json({ paid: false });
+    }
+
+    if (!payment) return res.json({ paid: false });
+
+    // If payment succeeded but webhook hasn't fired yet, verify with Stripe directly.
+    if (payment.status !== 'PAID' && stripe) {
+      try {
+        const session = await stripe.checkout.sessions.retrieve(session_id);
+        if (session.payment_status === 'paid') {
+          const qr = await findQuoteRequestById(payment.quote_id);
+          if (qr && !qr.depositPaid) {
+            await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['PAID', session_id]);
+            await activateDepositAndOpenChat(qr);
+          }
+          return res.json({ paid: true, quoteId: payment.quote_id });
+        }
+      } catch (_) {}
+    }
+
+    return res.json({ paid: payment.status === 'PAID', quoteId: payment.quote_id });
+  }
+
+  const qr = await findQuoteRequestById(quoteId);
+  if (!qr) return res.status(404).json({ message: 'Demande introuvable.' });
+  return res.json({ paid: qr.depositPaid, statut: qr.statut });
+});
+
+async function activateDepositAndOpenChat(quoteRequest) {
+  await query('UPDATE quote_requests SET deposit_paid = 1, statut = ? WHERE id = ?', ['ACCEPTE', quoteRequest.id]);
+
+  const channel = `quote_${quoteRequest.id}`;
+  const welcome = {
+    id: createId('msg'),
+    channel,
+    message: `Bienvenue chez Ulysse Media ! 🎉 Votre projet a officiellement démarré. Nous sommes ravis de travailler avec vous. N'hésitez pas à poser vos questions ici, votre chargé de projet vous accompagne.`,
+    user_id: 'SYSTEM',
+    username: 'Ulysse Media',
+    created_at: mysqlNow()
+  };
+  await query(
+    'INSERT INTO chat_messages (id, channel, message, user_id, username, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    [welcome.id, welcome.channel, welcome.message, welcome.user_id, welcome.username, welcome.created_at]
+  );
+
+  const chatMsg = { id: welcome.id, channel, message: welcome.message, userId: 'SYSTEM', username: 'Ulysse Media', createdAt: welcome.created_at };
+  emitToUser(quoteRequest.clientId, 'chat_message', chatMsg);
+  if (quoteRequest.assignedEmployeeId) emitToUser(quoteRequest.assignedEmployeeId, 'chat_message', chatMsg);
+
+  if (quoteRequest.assignedEmployeeId) {
+    await createNotification(quoteRequest.assignedEmployeeId, {
+      type: 'chat',
+      title: 'Projet démarré',
+      message: 'Le client a payé l\'acompte. Le chat est ouvert.',
+      link: `/backoffice/devis/${quoteRequest.id}`
+    });
+  }
+}
+
+// ── Chat rooms per quote request ──────────────────────────────────────────────
+app.get('/api/chat/rooms', auth, async (req, res) => {
+  let rows;
+  if (req.user.role === 'CLIENT') {
+    rows = await query(
+      `SELECT q.id as quote_id, q.service_type, q.statut, q.deposit_paid, q.assigned_employee_id,
+              u.username as employee_name,
+              (SELECT COUNT(*) FROM chat_messages WHERE channel = CONCAT('quote_', q.id)) as message_count
+       FROM quote_requests q
+       LEFT JOIN users u ON u.id = q.assigned_employee_id
+       WHERE q.client_id = ? AND q.deposit_paid = 1`,
+      [req.user.id]
+    );
+  } else if (req.user.role === 'EMPLOYE') {
+    rows = await query(
+      `SELECT q.id as quote_id, q.service_type, q.statut, q.deposit_paid, q.client_id,
+              u.username as client_name,
+              (SELECT COUNT(*) FROM chat_messages WHERE channel = CONCAT('quote_', q.id)) as message_count
+       FROM quote_requests q
+       LEFT JOIN users u ON u.id = q.client_id
+       WHERE q.assigned_employee_id = ? AND q.deposit_paid = 1`,
+      [req.user.id]
+    );
+  } else {
+    // ADMIN can see all
+    rows = await query(
+      `SELECT q.id as quote_id, q.service_type, q.statut, q.deposit_paid, q.client_id, q.assigned_employee_id,
+              uc.username as client_name, ue.username as employee_name,
+              (SELECT COUNT(*) FROM chat_messages WHERE channel = CONCAT('quote_', q.id)) as message_count
+       FROM quote_requests q
+       LEFT JOIN users uc ON uc.id = q.client_id
+       LEFT JOIN users ue ON ue.id = q.assigned_employee_id
+       WHERE q.deposit_paid = 1`
+    );
+  }
+  return res.json({ rooms: rows });
+});
+
+app.get('/api/chat/rooms/:quoteId/messages', auth, async (req, res) => {
+  const channel = `quote_${req.params.quoteId}`;
+  // Security: user must be client, assigned employee or admin for this quote
+  const qr = await findQuoteRequestById(req.params.quoteId);
+  if (!qr) return res.status(404).json({ message: 'Demande introuvable.' });
+  if (req.user.role === 'CLIENT' && qr.clientId !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+  if (req.user.role === 'EMPLOYE' && qr.assignedEmployeeId !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const rows = await query('SELECT * FROM chat_messages WHERE channel = ? ORDER BY created_at ASC LIMIT 200', [channel]);
+  return res.json({ messages: rows.map((r) => ({ id: r.id, channel: r.channel, message: r.message, userId: r.user_id, username: r.username, createdAt: r.created_at })) });
+});
+
+app.post('/api/chat/rooms/:quoteId/messages', auth, async (req, res) => {
+  const channel = `quote_${req.params.quoteId}`;
+  const qr = await findQuoteRequestById(req.params.quoteId);
+  if (!qr) return res.status(404).json({ message: 'Demande introuvable.' });
+  if (!qr.depositPaid) return res.status(400).json({ message: 'Le chat n\'est pas encore ouvert.' });
+  if (req.user.role === 'CLIENT' && qr.clientId !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+  if (req.user.role === 'EMPLOYE' && qr.assignedEmployeeId !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const { message } = req.body || {};
+  const cleanMessage = String(message || '').trim();
+  if (!cleanMessage) return res.status(400).json({ message: 'message requis.' });
+
+  const msg = { id: createId('msg'), channel, message: cleanMessage, user_id: req.user.id, username: req.user.username, created_at: mysqlNow() };
+  await query('INSERT INTO chat_messages (id, channel, message, user_id, username, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    [msg.id, msg.channel, msg.message, msg.user_id, msg.username, msg.created_at]);
+
+  const chatMsg = { id: msg.id, channel, message: msg.message, userId: msg.user_id, username: msg.username, createdAt: msg.created_at };
+  // Emit to participants, sender, and admins so all open backoffice chats update live.
+  emitToUser(qr.clientId, 'chat_message', chatMsg);
+  if (qr.assignedEmployeeId) emitToUser(qr.assignedEmployeeId, 'chat_message', chatMsg);
+  emitToUser(req.user.id, 'chat_message', chatMsg);
+  try {
+    const admins = await query('SELECT id FROM users WHERE role = ? AND suspended = 0', ['ADMIN']);
+    admins.forEach((admin) => emitToUser(admin.id, 'chat_message', chatMsg));
+  } catch (_) {}
+
+  return res.status(201).json({ message: chatMsg });
 });
 
 // ── Notifications REST endpoints ──────────────────────────────────────────────
@@ -1641,6 +1929,22 @@ async function bootstrapMySql() {
   await ensureColumnIfMissing('quote_requests', 'client_notified', 'TINYINT(1) NOT NULL DEFAULT 0');
   await ensureColumnIfMissing('quote_requests', 'client_seen', 'TINYINT(1) NOT NULL DEFAULT 0');
   await ensureColumnIfMissing('quote_requests', 'client_seen_at', 'DATETIME NULL');
+  await ensureColumnIfMissing('quote_requests', 'client_response', 'VARCHAR(20) NULL');
+  await ensureColumnIfMissing('quote_requests', 'deposit_paid', 'TINYINT(1) NOT NULL DEFAULT 0');
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id VARCHAR(64) PRIMARY KEY,
+      quote_id VARCHAR(64) NOT NULL,
+      stripe_session_id VARCHAR(255) NULL,
+      amount_cents INT NOT NULL,
+      currency VARCHAR(10) NOT NULL DEFAULT 'EUR',
+      status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+      created_at DATETIME NOT NULL,
+      INDEX idx_pay_quote (quote_id),
+      INDEX idx_pay_session (stripe_session_id)
+    )
+  `);
 
   await query(`
     CREATE TABLE IF NOT EXISTS notifications (

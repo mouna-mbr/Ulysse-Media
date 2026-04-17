@@ -1,0 +1,6 @@
+
+> ulysse-media-backend@1.0.0 start
+> node server.js
+
+◇ injected env (11) from .env // tip: ◈ encrypted .env [www.dotenvx.com]
+API Ulysse Media + MySQL (UlysseMediaDB) + Socket.IO démarrée sur le port 5000
