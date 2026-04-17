@@ -1,4 +1,5 @@
 const express = require('express');
+const http = require('http');
 const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -8,9 +9,65 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const mysql = require('mysql2/promise');
 const { parse } = require('csv-parse/sync');
+const { Server: SocketIOServer } = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
+const io = new SocketIOServer(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] }
+});
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Map userId -> Set of socket ids for targeted delivery
+const connectedUsers = new Map();
+
+io.on('connection', (socket) => {
+  socket.on('authenticate', ({ token }) => {
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET || 'ulysse-media-secret-dev');
+      socket.userId = payload.id;
+      if (!connectedUsers.has(payload.id)) connectedUsers.set(payload.id, new Set());
+      connectedUsers.get(payload.id).add(socket.id);
+    } catch (_) {}
+  });
+  socket.on('disconnect', () => {
+    if (socket.userId) {
+      const sockets = connectedUsers.get(socket.userId);
+      if (sockets) {
+        sockets.delete(socket.id);
+        if (!sockets.size) connectedUsers.delete(socket.userId);
+      }
+    }
+  });
+});
+
+function emitToUser(userId, event, data) {
+  const sockets = connectedUsers.get(userId);
+  if (sockets) sockets.forEach((sid) => io.to(sid).emit(event, data));
+}
+
+async function createNotification(userId, { title, message, link, type }) {
+  const notif = {
+    id: createId('notif'),
+    user_id: userId,
+    type: type || 'info',
+    title,
+    message: message || '',
+    link: link || '',
+    read: 0,
+    created_at: mysqlNow()
+  };
+  try {
+    await query(
+      'INSERT INTO notifications (id, user_id, type, title, message, link, `read`, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [notif.id, notif.user_id, notif.type, notif.title, notif.message, notif.link, notif.read, notif.created_at]
+    );
+    emitToUser(userId, 'notification', {
+      id: notif.id, type: notif.type, title: notif.title,
+      message: notif.message, link: notif.link, read: false, createdAt: notif.created_at
+    });
+  } catch (_) {}
+}
 
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -1102,6 +1159,20 @@ app.post('/api/quote-requests', auth, authorize('CLIENT'), uploadFile.fields([{ 
   );
 
   const savedQuoteRequest = await findQuoteRequestById(quoteRequest.id);
+
+  // Notify all admins
+  try {
+    const admins = await query('SELECT id FROM users WHERE role = ? AND suspended = 0', ['ADMIN']);
+    for (const admin of admins) {
+      await createNotification(admin.id, {
+        type: 'devis',
+        title: 'Nouvelle demande de devis',
+        message: `${savedQuoteRequest?.clientName || 'Un client'} a soumis une nouvelle demande de devis.`,
+        link: `/backoffice/devis/${quoteRequest.id}`
+      });
+    }
+  } catch (_) {}
+
   return res.status(201).json({ quoteRequest: savedQuoteRequest || quoteRequest });
 });
 
@@ -1258,6 +1329,14 @@ app.patch('/api/quote-requests/:id/assign', auth, authorize('ADMIN'), async (req
     [selectedEmployee.id, mysqlNow(), assignmentAuto ? 1 : 0, 'AFFECTE', quoteRequest.id]
   );
 
+  // Notify the assigned employee
+  await createNotification(selectedEmployee.id, {
+    type: 'devis',
+    title: 'Nouvelle demande affectée',
+    message: `Une demande de devis vous a été assignée.`,
+    link: `/backoffice/devis/${quoteRequest.id}`
+  });
+
   const updatedQuote = await findQuoteRequestById(quoteRequest.id);
   return res.json({ quoteRequest: updatedQuote });
 });
@@ -1270,6 +1349,11 @@ app.patch('/api/quote-requests/:id/study', auth, authorize('EMPLOYE'), uploadFil
 
   if (quoteRequest.assignedEmployeeId !== req.user.id) {
     return res.status(403).json({ message: 'Cette demande ne vous est pas assignee.' });
+  }
+
+  // Check if study has already been submitted
+  if (quoteRequest.study_json) {
+    return res.status(400).json({ message: 'Une etude a deja ete soumise pour cette demande.' });
   }
 
     const { tasks, complexity, notes } = req.body || {};
@@ -1304,6 +1388,19 @@ app.patch('/api/quote-requests/:id/study', auth, authorize('EMPLOYE'), uploadFil
     [JSON.stringify(study), mysqlNow(), 'ETUDE_ENVOYEE', quoteRequest.id]
   );
 
+  // Notify all admins
+  try {
+    const admins = await query('SELECT id FROM users WHERE role = ? AND suspended = 0', ['ADMIN']);
+    for (const admin of admins) {
+      await createNotification(admin.id, {
+        type: 'etude',
+        title: 'Etude soumise',
+        message: `L'employe a soumis une etude pour la demande de ${quoteRequest?.clientName || 'un client'}.`,
+        link: `/backoffice/devis/${quoteRequest.id}`
+      });
+    }
+  } catch (_) {}
+
   const updatedQuote = await findQuoteRequestById(quoteRequest.id);
   return res.json({ quoteRequest: updatedQuote });
 });
@@ -1312,6 +1409,11 @@ app.patch('/api/quote-requests/:id/final-estimation', auth, authorize('ADMIN'), 
   const quoteRequest = await findQuoteRequestById(req.params.id);
   if (!quoteRequest) {
     return res.status(404).json({ message: 'Demande de devis introuvable.' });
+  }
+
+  // Check if final estimation has already been submitted
+  if (quoteRequest.final_estimation_json) {
+    return res.status(400).json({ message: 'Une reponse a deja ete envoyee pour cette demande.' });
   }
 
   const { amount, breakdown, currency, deliveryDays } = req.body || {};
@@ -1335,8 +1437,44 @@ app.patch('/api/quote-requests/:id/final-estimation', auth, authorize('ADMIN'), 
     [JSON.stringify(finalEstimation), mysqlNow(), 'REPONDU', quoteRequest.id]
   );
 
+  // Notify the client
+  await createNotification(quoteRequest.clientId, {
+    type: 'devis',
+    title: 'Réponse à votre devis',
+    message: 'Votre demande de devis a reçu une réponse. Consultez les détails.',
+    link: `/mes-devis/${quoteRequest.id}`
+  });
+
   const updatedQuote = await findQuoteRequestById(quoteRequest.id);
   return res.json({ quoteRequest: updatedQuote });
+});
+
+// ── Notifications REST endpoints ──────────────────────────────────────────────
+app.get('/api/notifications', auth, async (req, res) => {
+  const rows = await query(
+    'SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50',
+    [req.user.id]
+  );
+  const notifications = rows.map((row) => ({
+    id: row.id,
+    type: row.type,
+    title: row.title,
+    message: row.message,
+    link: row.link,
+    read: !!row.read,
+    createdAt: row.created_at
+  }));
+  return res.json({ notifications });
+});
+
+app.patch('/api/notifications/read-all', auth, async (req, res) => {
+  await query('UPDATE notifications SET `read` = 1 WHERE user_id = ?', [req.user.id]);
+  return res.json({ success: true });
+});
+
+app.patch('/api/notifications/:id/read', auth, async (req, res) => {
+  await query('UPDATE notifications SET `read` = 1 WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
+  return res.json({ success: true });
 });
 
 app.get('/api/chat/messages', auth, async (req, res) => {
@@ -1505,6 +1643,20 @@ async function bootstrapMySql() {
   await ensureColumnIfMissing('quote_requests', 'client_seen_at', 'DATETIME NULL');
 
   await query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id VARCHAR(64) PRIMARY KEY,
+      user_id VARCHAR(64) NOT NULL,
+      type VARCHAR(32) NOT NULL DEFAULT 'info',
+      title VARCHAR(255) NOT NULL,
+      message TEXT NULL,
+      link VARCHAR(500) NULL,
+      \`read\` TINYINT(1) NOT NULL DEFAULT 0,
+      created_at DATETIME NOT NULL,
+      INDEX idx_notif_user (user_id)
+    )
+  `);
+
+  await query(`
     CREATE TABLE IF NOT EXISTS services (
       id VARCHAR(64) PRIMARY KEY,
       name VARCHAR(190) NOT NULL,
@@ -1650,8 +1802,8 @@ async function bootstrapMySql() {
 
 bootstrapMySql()
   .then(() => {
-    app.listen(PORT, () => {
-      console.log(`API Ulysse Media + MySQL (${MYSQL_DATABASE}) démarrée sur le port ${PORT}`);
+    server.listen(PORT, () => {
+      console.log(`API Ulysse Media + MySQL (${MYSQL_DATABASE}) + Socket.IO démarrée sur le port ${PORT}`);
     });
   })
   .catch((error) => {
