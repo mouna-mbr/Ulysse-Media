@@ -13,6 +13,7 @@ const mysql = require('mysql2/promise');
 const { parse } = require('csv-parse/sync');
 const { Server: SocketIOServer } = require('socket.io');
 const Stripe = require('stripe');
+const { google } = require('googleapis');
 
 const app = express();
 const server = http.createServer(app);
@@ -97,6 +98,11 @@ const MYSQL_DATABASE = process.env.MYSQL_DATABASE || 'UlysseMediaDB';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || '';
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
+const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
 
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
@@ -309,6 +315,50 @@ function mapQuoteRequestRow(row) {
   };
 }
 
+function mapMeetingRow(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description || '',
+    start: row.start_date,
+    end: row.end_date,
+    timezone: row.timezone || 'Europe/Paris',
+    status: row.status,
+    syncStatus: row.sync_status,
+    meetLink: row.meet_link || null,
+    googleEventId: row.google_event_id || null,
+    createdBy: row.created_by,
+    clientUserId: row.client_user_id || null,
+    clientEmail: row.client_email || null,
+    clientName: row.client_name || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function isGoogleCalendarConfigured() {
+  return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REDIRECT_URI && GOOGLE_REFRESH_TOKEN);
+}
+
+function getGoogleOAuthClient() {
+  if (!isGoogleCalendarConfigured()) return null;
+  const client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+  client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+  return client;
+}
+
+function getGoogleCalendarClient() {
+  const authClient = getGoogleOAuthClient();
+  if (!authClient) return null;
+  return google.calendar({ version: 'v3', auth: authClient });
+}
+
+function parseDateInput(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  return date;
+}
+
 function toPublicUploadUrl(req, filename) {
   if (!filename) return '';
   return `${req.protocol}://${req.get('host')}/uploads/${filename}`;
@@ -351,6 +401,80 @@ async function findUserByEmail(email) {
 async function findUserById(id) {
   const rows = await query('SELECT * FROM users WHERE id = ? LIMIT 1', [id]);
   return rows[0] ? mapUserRow(rows[0]) : null;
+}
+
+async function createGoogleMeetingEvent({ title, description, startIso, endIso, timezone, attendeeEmails, requestId }) {
+  const calendar = getGoogleCalendarClient();
+  if (!calendar) throw new Error('Google Calendar n\'est pas configure sur le serveur.');
+
+  const response = await calendar.events.insert({
+    calendarId: GOOGLE_CALENDAR_ID,
+    conferenceDataVersion: 1,
+    sendUpdates: 'all',
+    requestBody: {
+      summary: title,
+      description: description || '',
+      start: { dateTime: startIso, timeZone: timezone },
+      end: { dateTime: endIso, timeZone: timezone },
+      attendees: attendeeEmails.map((email) => ({ email })),
+      conferenceData: {
+        createRequest: {
+          requestId,
+          conferenceSolutionKey: { type: 'hangoutsMeet' }
+        }
+      },
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'email', minutes: 24 * 60 },
+          { method: 'popup', minutes: 30 }
+        ]
+      }
+    }
+  });
+
+  const event = response.data;
+  const meetLink = event.hangoutLink
+    || (event.conferenceData?.entryPoints || []).find((entry) => entry.entryPointType === 'video')?.uri
+    || null;
+
+  return { googleEventId: event.id, meetLink };
+}
+
+async function updateGoogleMeetingEvent({ googleEventId, title, description, startIso, endIso, timezone, attendeeEmails }) {
+  const calendar = getGoogleCalendarClient();
+  if (!calendar) throw new Error('Google Calendar n\'est pas configure sur le serveur.');
+
+  const response = await calendar.events.patch({
+    calendarId: GOOGLE_CALENDAR_ID,
+    eventId: googleEventId,
+    sendUpdates: 'all',
+    requestBody: {
+      summary: title,
+      description: description || '',
+      start: { dateTime: startIso, timeZone: timezone },
+      end: { dateTime: endIso, timeZone: timezone },
+      attendees: attendeeEmails.map((email) => ({ email }))
+    }
+  });
+
+  const event = response.data;
+  const meetLink = event.hangoutLink
+    || (event.conferenceData?.entryPoints || []).find((entry) => entry.entryPointType === 'video')?.uri
+    || null;
+
+  return { meetLink };
+}
+
+async function cancelGoogleMeetingEvent(googleEventId) {
+  const calendar = getGoogleCalendarClient();
+  if (!calendar) throw new Error('Google Calendar n\'est pas configure sur le serveur.');
+
+  await calendar.events.delete({
+    calendarId: GOOGLE_CALENDAR_ID,
+    eventId: googleEventId,
+    sendUpdates: 'all'
+  });
 }
 
 function makeToken(user) {
@@ -1800,36 +1924,311 @@ app.post('/api/chat/messages', auth, async (req, res) => {
   return res.status(201).json({ message: msg });
 });
 
-app.get('/api/calendar/events', auth, async (req, res) => {
-  const rows = await query('SELECT * FROM calendar_events ORDER BY start_date ASC');
-  const events = rows.map((row) => ({
-    id: row.id,
-    title: row.title,
-    start: row.start_date,
-    end: row.end_date,
-    createdBy: row.created_by
-  }));
-  return res.json({ events });
+app.get('/api/google/auth-url', auth, authorize('ADMIN'), async (_req, res) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
+    return res.status(400).json({ message: 'Configuration Google OAuth2 incomplete.' });
+  }
+
+  const oauthClient = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+  const url = oauthClient.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: ['https://www.googleapis.com/auth/calendar']
+  });
+
+  return res.json({ url });
 });
 
-app.post('/api/calendar/events', auth, async (req, res) => {
-  const { title, start, end } = req.body;
-  if (!title || !start || !end) {
-    return res.status(400).json({ message: 'title, start, end requis.' });
+app.get('/api/google/oauth2/callback', async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).json({ message: 'code requis.' });
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
+    return res.status(400).json({ message: 'Configuration Google OAuth2 incomplete.' });
   }
-  const event = {
-    id: createId('evt'),
-    title,
-    start,
-    end,
-    createdBy: req.user.id
-  };
-  await query(
-    `INSERT INTO calendar_events (id, title, start_date, end_date, created_by)
-     VALUES (?, ?, ?, ?, ?)`,
-    [event.id, event.title, event.start, event.end, event.createdBy]
+
+  try {
+    const oauthClient = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
+    const { tokens } = await oauthClient.getToken(String(code));
+    return res.json({
+      message: 'OAuth2 configure. Copiez refresh_token dans GOOGLE_REFRESH_TOKEN.',
+      refreshToken: tokens.refresh_token || null,
+      accessToken: tokens.access_token || null,
+      expiryDate: tokens.expiry_date || null
+    });
+  } catch (error) {
+    return res.status(400).json({ message: error.message || 'Impossible de finaliser OAuth2.' });
+  }
+});
+
+app.get('/api/events/participants', auth, authorize('ADMIN', 'EMPLOYE'), async (_req, res) => {
+  const rows = await query(
+    'SELECT id, username, email FROM users WHERE role = ? AND suspended = 0 ORDER BY username ASC',
+    ['CLIENT']
   );
-  return res.status(201).json({ event });
+  return res.json({ participants: rows.map((row) => ({ id: row.id, username: row.username, email: row.email })) });
+});
+
+app.get('/api/events', auth, async (req, res) => {
+  let rows = [];
+  if (req.user.role === 'CLIENT') {
+    rows = await query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       WHERE m.client_user_id = ?
+       ORDER BY m.start_date ASC`,
+      [req.user.id]
+    );
+  } else if (req.user.role === 'EMPLOYE') {
+    rows = await query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       WHERE m.created_by = ?
+       ORDER BY m.start_date ASC`,
+      [req.user.id]
+    );
+  } else {
+    rows = await query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       ORDER BY m.start_date ASC`
+    );
+  }
+
+  return res.json({ events: rows.map(mapMeetingRow) });
+});
+
+app.post('/api/events', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const { title, description, start, end, timezone, clientUserId } = req.body || {};
+  if (!title || !start || !end || !clientUserId) {
+    return res.status(400).json({ message: 'title, start, end, clientUserId requis.' });
+  }
+
+  const startDate = parseDateInput(start);
+  const endDate = parseDateInput(end);
+  if (!startDate || !endDate || endDate <= startDate) {
+    return res.status(400).json({ message: 'Dates invalides.' });
+  }
+
+  const organizer = await findUserById(req.user.id);
+  const client = await findUserById(clientUserId);
+  if (!organizer || !organizer.email) return res.status(404).json({ message: 'Organisateur introuvable.' });
+  if (!client || client.role !== 'CLIENT' || !client.email) return res.status(404).json({ message: 'Client introuvable.' });
+
+  const eventId = createId('meet');
+  const tz = timezone || 'Europe/Paris';
+  const startSql = startDate.toISOString().slice(0, 19).replace('T', ' ');
+  const endSql = endDate.toISOString().slice(0, 19).replace('T', ' ');
+
+  await query(
+    `INSERT INTO meetings (
+      id, title, description, start_date, end_date, timezone, created_by, client_user_id,
+      status, sync_status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [eventId, String(title).trim(), description ? String(description).trim() : '', startSql, endSql, tz, req.user.id, client.id, 'SCHEDULED', 'PENDING', mysqlNow(), mysqlNow()]
+  );
+
+  try {
+    if (!isGoogleCalendarConfigured()) {
+      throw new Error('Google Calendar n\'est pas configure sur le serveur.');
+    }
+
+    const attendeeEmails = [...new Set([organizer.email, client.email])];
+    const { googleEventId, meetLink } = await createGoogleMeetingEvent({
+      title: String(title).trim(),
+      description: description ? String(description).trim() : '',
+      startIso: startDate.toISOString(),
+      endIso: endDate.toISOString(),
+      timezone: tz,
+      attendeeEmails,
+      requestId: `${eventId}_${Date.now()}`
+    });
+
+    await query(
+      'UPDATE meetings SET google_event_id = ?, meet_link = ?, sync_status = ?, updated_at = ? WHERE id = ?',
+      [googleEventId, meetLink, 'SYNCED', mysqlNow(), eventId]
+    );
+
+    const rows = await query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       WHERE m.id = ? LIMIT 1`,
+      [eventId]
+    );
+
+    return res.status(201).json({ event: mapMeetingRow(rows[0]) });
+  } catch (error) {
+    await query(
+      'UPDATE meetings SET sync_status = ?, last_sync_error = ?, updated_at = ? WHERE id = ?',
+      ['FAILED', error.message || 'Erreur de synchronisation Google Calendar', mysqlNow(), eventId]
+    );
+    return res.status(502).json({ message: error.message || 'Impossible de creer la reunion Google Meet.' });
+  }
+});
+
+app.put('/api/events/:id', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const rows = await query('SELECT * FROM meetings WHERE id = ? LIMIT 1', [req.params.id]);
+  const event = rows[0];
+  if (!event) return res.status(404).json({ message: 'Evenement introuvable.' });
+
+  const canEdit = req.user.role === 'ADMIN' || event.created_by === req.user.id;
+  if (!canEdit) return res.status(403).json({ message: 'Acces interdit.' });
+  if (event.status === 'CANCELED') return res.status(400).json({ message: 'Evenement deja annule.' });
+
+  const nextTitle = req.body?.title ? String(req.body.title).trim() : event.title;
+  const nextDescription = req.body?.description !== undefined ? String(req.body.description || '').trim() : (event.description || '');
+  const nextTimezone = req.body?.timezone || event.timezone || 'Europe/Paris';
+  const nextStart = req.body?.start ? parseDateInput(req.body.start) : new Date(event.start_date);
+  const nextEnd = req.body?.end ? parseDateInput(req.body.end) : new Date(event.end_date);
+
+  if (!nextTitle || !nextStart || !nextEnd || nextEnd <= nextStart) {
+    return res.status(400).json({ message: 'Donnees invalides pour la mise a jour.' });
+  }
+
+  const organizer = await findUserById(event.created_by);
+  const client = await findUserById(event.client_user_id);
+  if (!organizer?.email || !client?.email) return res.status(400).json({ message: 'Participants introuvables.' });
+
+  await query(
+    `UPDATE meetings
+     SET title = ?, description = ?, start_date = ?, end_date = ?, timezone = ?, sync_status = ?, updated_at = ?
+     WHERE id = ?`,
+    [
+      nextTitle,
+      nextDescription,
+      nextStart.toISOString().slice(0, 19).replace('T', ' '),
+      nextEnd.toISOString().slice(0, 19).replace('T', ' '),
+      nextTimezone,
+      'PENDING',
+      mysqlNow(),
+      event.id
+    ]
+  );
+
+  try {
+    const attendeeEmails = [...new Set([organizer.email, client.email])];
+
+    if (!event.google_event_id) {
+      const { googleEventId, meetLink } = await createGoogleMeetingEvent({
+        title: nextTitle,
+        description: nextDescription,
+        startIso: nextStart.toISOString(),
+        endIso: nextEnd.toISOString(),
+        timezone: nextTimezone,
+        attendeeEmails,
+        requestId: `${event.id}_${Date.now()}`
+      });
+
+      await query(
+        'UPDATE meetings SET google_event_id = ?, meet_link = ?, sync_status = ?, last_sync_error = NULL, updated_at = ? WHERE id = ?',
+        [googleEventId, meetLink, 'SYNCED', mysqlNow(), event.id]
+      );
+    } else {
+      const { meetLink } = await updateGoogleMeetingEvent({
+        googleEventId: event.google_event_id,
+        title: nextTitle,
+        description: nextDescription,
+        startIso: nextStart.toISOString(),
+        endIso: nextEnd.toISOString(),
+        timezone: nextTimezone,
+        attendeeEmails
+      });
+
+      await query(
+        'UPDATE meetings SET meet_link = ?, sync_status = ?, last_sync_error = NULL, updated_at = ? WHERE id = ?',
+        [meetLink, 'SYNCED', mysqlNow(), event.id]
+      );
+    }
+  } catch (error) {
+    await query(
+      'UPDATE meetings SET sync_status = ?, last_sync_error = ?, updated_at = ? WHERE id = ?',
+      ['FAILED', error.message || 'Erreur de synchronisation Google Calendar', mysqlNow(), event.id]
+    );
+    return res.status(502).json({ message: error.message || 'Impossible de mettre a jour la reunion Google Meet.' });
+  }
+
+  const updatedRows = await query(
+    `SELECT m.*, u.username AS client_name, u.email AS client_email
+     FROM meetings m
+     LEFT JOIN users u ON u.id = m.client_user_id
+     WHERE m.id = ? LIMIT 1`,
+    [event.id]
+  );
+
+  return res.json({ event: mapMeetingRow(updatedRows[0]) });
+});
+
+app.delete('/api/events/:id', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const rows = await query('SELECT * FROM meetings WHERE id = ? LIMIT 1', [req.params.id]);
+  const event = rows[0];
+  if (!event) return res.status(404).json({ message: 'Evenement introuvable.' });
+
+  const canDelete = req.user.role === 'ADMIN' || event.created_by === req.user.id;
+  if (!canDelete) return res.status(403).json({ message: 'Acces interdit.' });
+  if (event.status === 'CANCELED') return res.json({ success: true, alreadyCanceled: true });
+
+  await query(
+    'UPDATE meetings SET status = ?, sync_status = ?, updated_at = ? WHERE id = ?',
+    ['CANCELED', 'PENDING', mysqlNow(), event.id]
+  );
+
+  try {
+    if (event.google_event_id) {
+      await cancelGoogleMeetingEvent(event.google_event_id);
+    }
+
+    await query(
+      'UPDATE meetings SET sync_status = ?, last_sync_error = NULL, updated_at = ? WHERE id = ?',
+      ['SYNCED', mysqlNow(), event.id]
+    );
+  } catch (error) {
+    await query(
+      'UPDATE meetings SET sync_status = ?, last_sync_error = ?, updated_at = ? WHERE id = ?',
+      ['FAILED', error.message || 'Erreur de synchronisation Google Calendar', mysqlNow(), event.id]
+    );
+    return res.status(502).json({ message: error.message || 'Impossible d\'annuler la reunion Google Meet.' });
+  }
+
+  return res.json({ success: true });
+});
+
+// Backward-compatible aliases
+app.get('/api/calendar/events', auth, async (req, res) => {
+  let rows = [];
+  if (req.user.role === 'CLIENT') {
+    rows = await query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       WHERE m.client_user_id = ?
+       ORDER BY m.start_date ASC`,
+      [req.user.id]
+    );
+  } else if (req.user.role === 'EMPLOYE') {
+    rows = await query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       WHERE m.created_by = ?
+       ORDER BY m.start_date ASC`,
+      [req.user.id]
+    );
+  } else {
+    rows = await query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       ORDER BY m.start_date ASC`
+    );
+  }
+  return res.json({ events: rows.map(mapMeetingRow) });
+});
+
+app.post('/api/calendar/events', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  return res.status(400).json({ message: 'Utilisez /api/events avec clientUserId pour creer une reunion.' });
 });
 
 app.use((error, _req, res, _next) => {
@@ -2032,6 +2431,30 @@ async function bootstrapMySql() {
       start_date DATETIME NOT NULL,
       end_date DATETIME NOT NULL,
       created_by VARCHAR(64) NOT NULL
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS meetings (
+      id VARCHAR(64) PRIMARY KEY,
+      title VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      start_date DATETIME NOT NULL,
+      end_date DATETIME NOT NULL,
+      timezone VARCHAR(64) NOT NULL DEFAULT 'Europe/Paris',
+      created_by VARCHAR(64) NOT NULL,
+      client_user_id VARCHAR(64) NOT NULL,
+      google_event_id VARCHAR(255) NULL,
+      meet_link TEXT NULL,
+      status ENUM('SCHEDULED', 'CANCELED') NOT NULL DEFAULT 'SCHEDULED',
+      sync_status ENUM('PENDING', 'SYNCED', 'FAILED') NOT NULL DEFAULT 'PENDING',
+      last_sync_error TEXT NULL,
+      created_at DATETIME NOT NULL,
+      updated_at DATETIME NOT NULL,
+      INDEX idx_meetings_start (start_date),
+      INDEX idx_meetings_client (client_user_id),
+      INDEX idx_meetings_creator (created_by),
+      UNIQUE KEY uq_meetings_google_event (google_event_id)
     )
   `);
 
