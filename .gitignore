@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build
+build/
+**/build/
+
+# Env
+.env
+*.env
+
+# Logs
+*.log
+
+# Uploads (optionnel si tu veux pas push les fichiers)
+Ulysse-Media-Backend/uploads/

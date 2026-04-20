@@ -1,0 +1,7 @@
+username,email,password,role,specialite,tauxHoraire,disponibilite,niveau,tel,address
+amine.video,amine.video+test@ulyssemedia.com,Temp1234!,EMPLOYE,Videomaking,45,true,STANDARD,,
+sara.design,sara.design+test@ulyssemedia.com,Temp1234!,EMPLOYE,Design graphique,50,true,SENIOR,,
+karim.social,karim.social+test@ulyssemedia.com,Temp1234!,EMPLOYE,Social media,40,false,JUNIOR,,
+leila.client,leila.client+test@ulyssemedia.com,Temp1234!,CLIENT,,,true,STANDARD,+33 6 12 34 56 78,"12 Rue de Paris, 75001 Paris"
+mehdi.client,mehdi.client+test@ulyssemedia.com,Temp1234!,CLIENT,,,true,STANDARD,+33 6 98 76 54 32,"45 Avenue Hassan II, Casablanca"
+nadia.admin,nadia.admin+test@ulyssemedia.com,Temp1234!,ADMIN,,,true,EXPERT,,
