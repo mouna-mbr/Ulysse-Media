@@ -198,6 +198,23 @@ function normalizeIncludedInput(rawIncluded) {
   return [];
 }
 
+function normalizeStringList(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        return parsed.map((item) => String(item || '').trim()).filter(Boolean);
+      }
+    } catch (_error) {
+      return value.split('\n').map((item) => item.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
 function normalizeAssetType(type, url = '') {
   if (type) return String(type).trim().toLowerCase();
   if (url.endsWith('.pdf')) return 'pdf';
@@ -311,6 +328,8 @@ function mapQuoteRequestRow(row) {
     clientSeenAt: row.client_seen_at || null,
     clientResponse: row.client_response || null,
     depositPaid: !!row.deposit_paid,
+    projectStatus: row.project_status || 'NOT_STARTED',
+    projectCompletionPercent: Number(row.project_completion_percent || 0),
     dateCreation: row.date_creation
   };
 }
@@ -329,11 +348,227 @@ function mapMeetingRow(row) {
     googleEventId: row.google_event_id || null,
     createdBy: row.created_by,
     clientUserId: row.client_user_id || null,
+    projectId: row.project_id || null,
     clientEmail: row.client_email || null,
     clientName: row.client_name || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function mapProjectSummaryRow(row) {
+  return {
+    id: row.id,
+    name: row.service_name || row.service_type || 'Projet',
+    description: row.description || '',
+    status: row.statut,
+    projectStatus: row.project_status || 'NOT_STARTED',
+    completionPercent: Number(row.project_completion_percent || 0),
+    clientId: row.client_id,
+    clientName: row.client_username || null,
+    assignedEmployeeId: row.assigned_employee_id || null,
+    assignedEmployeeName: row.employee_username || null,
+    depositPaid: !!row.deposit_paid,
+    deadline: row.deadline || null,
+    createdAt: row.date_creation,
+    taskStats: {
+      total: Number(row.tasks_total || 0),
+      toDo: Number(row.tasks_todo || 0),
+      doing: Number(row.tasks_doing || 0),
+      ready: Number(row.tasks_ready || 0)
+    }
+  };
+}
+
+function mapProjectTaskRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    title: row.title,
+    description: row.description || '',
+    status: row.status,
+    assignedEmployeeId: row.assigned_employee_id || null,
+    assignedEmployeeName: row.assigned_employee_name || null,
+    meetingId: row.meeting_id || null,
+    milestoneId: row.milestone_id || null,
+    deadline: row.deadline || null,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapMilestoneRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    title: row.title,
+    description: row.description || '',
+    amountCents: Number(row.amount_cents || 0),
+    percent: Number(row.percent || 0),
+    orderIndex: Number(row.order_index || 0),
+    status: row.status,
+    validationMeetingId: row.validation_meeting_id || null,
+    dueDate: row.due_date || null,
+    paidAt: row.paid_at || null,
+    paymentId: row.payment_id || null,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapMeetingReportRow(row) {
+  return {
+    id: row.id,
+    meetingId: row.meeting_id,
+    projectId: row.project_id,
+    summary: row.summary || '',
+    decisions: parseJsonArray(row.decisions_json),
+    blockers: parseJsonArray(row.blockers_json),
+    actionItems: parseJsonArray(row.action_items_json),
+    nextSteps: parseJsonArray(row.next_steps_json),
+    createdBy: row.created_by,
+    createdByName: row.created_by_name || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapDeliverableRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    title: row.title,
+    description: row.description || '',
+    fileUrl: row.file_url || null,
+    fileName: row.file_name || null,
+    locked: !!row.locked,
+    visibleToClient: !!row.visible_to_client,
+    createdBy: row.created_by,
+    createdByName: row.created_by_name || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function canAccessProject(user, projectRow) {
+  if (!user || !projectRow) return false;
+  if (user.role === 'ADMIN') return true;
+  if (user.role === 'EMPLOYE') return projectRow.assigned_employee_id === user.id;
+  if (user.role === 'CLIENT') return projectRow.client_id === user.id;
+  return false;
+}
+
+function canManageProjectTasks(user, projectRow) {
+  if (!user || !projectRow) return false;
+  if (user.role === 'ADMIN') return true;
+  if (user.role === 'EMPLOYE') return projectRow.assigned_employee_id === user.id;
+  return false;
+}
+
+function canManageProjectWorkflow(user, projectRow) {
+  return canManageProjectTasks(user, projectRow);
+}
+
+async function findProjectById(projectId) {
+  const rows = await query(
+    `SELECT q.*, c.username AS client_username, e.username AS employee_username, s.name AS service_name
+     FROM quote_requests q
+     LEFT JOIN users c ON c.id = q.client_id
+     LEFT JOIN users e ON e.id = q.assigned_employee_id
+     LEFT JOIN services s ON s.id = q.service_id
+     WHERE q.id = ?
+     LIMIT 1`,
+    [projectId]
+  );
+  return rows[0] || null;
+}
+
+async function resolveProjectFromMeeting(meeting, fallbackProjectId = null) {
+  if (meeting?.project_id) {
+    return findProjectById(meeting.project_id);
+  }
+
+  if (!fallbackProjectId) {
+    return null;
+  }
+
+  const project = await findProjectById(fallbackProjectId);
+  if (!project) return null;
+  if (project.client_id !== meeting.client_user_id) return null;
+
+  // Backfill legacy meetings so future calls resolve immediately.
+  await query('UPDATE meetings SET project_id = ?, updated_at = ? WHERE id = ?', [project.id, mysqlNow(), meeting.id]);
+  return project;
+}
+
+async function getProjectFinancialSummary(projectId) {
+  const milestoneRows = await query(
+    `SELECT id, amount_cents, percent, status
+     FROM project_milestones
+     WHERE project_id = ?
+     ORDER BY order_index ASC, created_at ASC`,
+    [projectId]
+  );
+
+  const quoteRows = await query(
+    `SELECT final_estimation_json, deposit_paid, kickoff_paid
+     FROM quote_requests
+     WHERE id = ?
+     LIMIT 1`,
+    [projectId]
+  );
+  const quote = quoteRows[0] || null;
+  const estimation = quote ? parseJsonObject(quote.final_estimation_json) : null;
+  const rawEstimateAmount = Number(estimation?.amount);
+  const totalFromEstimate = Number.isFinite(rawEstimateAmount) && rawEstimateAmount > 0
+    ? Math.round(rawEstimateAmount * 100)
+    : 0;
+  const totalFromMilestones = milestoneRows.reduce((sum, row) => sum + Number(row.amount_cents || 0), 0);
+  // Use quote estimation as authoritative project total when available.
+  const totalCents = totalFromEstimate || totalFromMilestones || 0;
+
+  let paidCents = 0;
+  if (quote?.deposit_paid && totalCents > 0) {
+    paidCents += Math.round(totalCents * 0.1);
+  }
+  if (quote?.kickoff_paid && totalCents > 0) {
+    paidCents += Math.round(totalCents * 0.2);
+  }
+  paidCents += milestoneRows
+    .filter((row) => row.status === 'PAID')
+    .reduce((sum, row) => sum + Number(row.amount_cents || 0), 0);
+
+  const effectivePaidCents = totalCents > 0 ? Math.min(totalCents, paidCents) : paidCents;
+
+  const paidPercent = totalCents > 0 ? Math.min(100, Math.round((effectivePaidCents / totalCents) * 100)) : 0;
+  return {
+    totalCents,
+    paidCents: effectivePaidCents,
+    paidPercent,
+    milestonesCount: milestoneRows.length,
+    paidMilestonesCount: milestoneRows.filter((row) => row.status === 'PAID').length,
+    depositPaid: !!quote?.deposit_paid,
+    kickoffPaid: !!quote?.kickoff_paid
+  };
+}
+
+async function syncProjectProgress(projectId, preferredStatus = null) {
+  const financial = await getProjectFinancialSummary(projectId);
+  const nextStatus = preferredStatus || (financial.paidPercent >= 100 ? 'DELIVERY_READY' : 'IN_PROGRESS');
+
+  await query(
+    `UPDATE quote_requests
+     SET project_completion_percent = ?, project_status = ?, statut = CASE
+       WHEN ? = 'DELIVERY_READY' THEN 'ACCEPTE'
+       ELSE statut
+     END
+     WHERE id = ?`,
+    [financial.paidPercent, nextStatus, nextStatus, projectId]
+  );
+
+  return { ...financial, projectStatus: nextStatus };
 }
 
 function isGoogleCalendarConfigured() {
@@ -1684,8 +1919,22 @@ app.post('/api/payments/webhook', async (req, res) => {
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const { quoteId } = session.metadata || {};
-    if (quoteId) {
+    const { quoteId, type, milestoneId, projectId } = session.metadata || {};
+
+    if (type === 'milestone' && milestoneId && projectId) {
+      await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['PAID', session.id]);
+      await query(
+        `UPDATE project_milestones
+         SET status = 'PAID', paid_at = ?, payment_id = ?, updated_at = ?
+         WHERE id = ? AND project_id = ?`,
+        [mysqlNow(), session.id, mysqlNow(), milestoneId, projectId]
+      );
+      await syncProjectProgress(projectId);
+    } else if (type === 'kickoff20' && projectId) {
+      await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['PAID', session.id]);
+      await query('UPDATE quote_requests SET kickoff_paid = 1 WHERE id = ?', [projectId]);
+      await syncProjectProgress(projectId);
+    } else if (quoteId) {
       const quoteRequest = await findQuoteRequestById(quoteId);
       if (quoteRequest && !quoteRequest.depositPaid) {
         await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['PAID', session.id]);
@@ -1697,6 +1946,14 @@ app.post('/api/payments/webhook', async (req, res) => {
   if (event.type === 'checkout.session.expired' || event.type === 'payment_intent.payment_failed') {
     const session = event.data.object;
     await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['FAILED', session.id]).catch(() => {});
+    if (session?.metadata?.type === 'milestone' && session?.metadata?.milestoneId) {
+      await query(
+        `UPDATE project_milestones
+         SET status = 'FAILED', updated_at = ?
+         WHERE id = ?`,
+        [mysqlNow(), session.metadata.milestoneId]
+      ).catch(() => {});
+    }
   }
 
   return res.json({ received: true });
@@ -1714,13 +1971,37 @@ app.get('/api/payments/verify', async (req, res) => {
     if (!payment && stripe) {
       try {
         const session = await stripe.checkout.sessions.retrieve(session_id);
-        const quoteIdFromStripe = session?.metadata?.quoteId;
-        if (session?.payment_status === 'paid' && quoteIdFromStripe) {
-          const qr = await findQuoteRequestById(quoteIdFromStripe);
-          if (qr && !qr.depositPaid) {
-            await activateDepositAndOpenChat(qr);
+        const quoteIdFromStripe = session?.metadata?.quoteId || null;
+        const projectIdFromStripe = session?.metadata?.projectId || quoteIdFromStripe;
+        const paymentType = String(session?.metadata?.type || '').toLowerCase();
+
+        if (session?.payment_status === 'paid') {
+          if (paymentType === 'kickoff20' && projectIdFromStripe) {
+            await query('UPDATE quote_requests SET kickoff_paid = 1 WHERE id = ?', [projectIdFromStripe]).catch(() => {});
+            await syncProjectProgress(projectIdFromStripe).catch(() => {});
+            return res.json({ paid: true, quoteId: quoteIdFromStripe, projectId: projectIdFromStripe, paymentType: 'KICKOFF20' });
           }
-          return res.json({ paid: true, quoteId: quoteIdFromStripe });
+
+          if (paymentType === 'milestone' && projectIdFromStripe && session?.metadata?.milestoneId) {
+            await query(
+              `UPDATE project_milestones
+               SET status = 'PAID', paid_at = ?, payment_id = ?, updated_at = ?
+               WHERE id = ? AND project_id = ?`,
+              [mysqlNow(), session.id, mysqlNow(), session.metadata.milestoneId, projectIdFromStripe]
+            ).catch(() => {});
+            await syncProjectProgress(projectIdFromStripe).catch(() => {});
+            return res.json({ paid: true, quoteId: quoteIdFromStripe, projectId: projectIdFromStripe, paymentType: 'MILESTONE' });
+          }
+
+          if (quoteIdFromStripe) {
+            const qr = await findQuoteRequestById(quoteIdFromStripe);
+            if (qr && !qr.depositPaid) {
+              await activateDepositAndOpenChat(qr);
+            }
+            return res.json({ paid: true, quoteId: quoteIdFromStripe, projectId: quoteIdFromStripe, paymentType: 'DEPOSIT' });
+          }
+
+          return res.json({ paid: true, paymentType: paymentType || 'UNKNOWN' });
         }
       } catch (_) {}
       return res.json({ paid: false });
@@ -1733,17 +2014,45 @@ app.get('/api/payments/verify', async (req, res) => {
       try {
         const session = await stripe.checkout.sessions.retrieve(session_id);
         if (session.payment_status === 'paid') {
+          const metadataType = String(session?.metadata?.type || '').toLowerCase();
+          const paymentType = metadataType || String(payment.payment_type || '').toLowerCase();
+          await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['PAID', session_id]);
+
+          if (paymentType === 'kickoff20') {
+            await query('UPDATE quote_requests SET kickoff_paid = 1 WHERE id = ?', [payment.quote_id]);
+            await syncProjectProgress(payment.quote_id);
+            return res.json({ paid: true, quoteId: payment.quote_id, projectId: payment.quote_id, paymentType: 'KICKOFF20' });
+          }
+
+          if (paymentType === 'milestone') {
+            const milestoneId = session?.metadata?.milestoneId || payment.milestone_id;
+            if (milestoneId) {
+              await query(
+                `UPDATE project_milestones
+                 SET status = 'PAID', paid_at = ?, payment_id = ?, updated_at = ?
+                 WHERE id = ? AND project_id = ?`,
+                [mysqlNow(), session_id, mysqlNow(), milestoneId, payment.quote_id]
+              );
+            }
+            await syncProjectProgress(payment.quote_id);
+            return res.json({ paid: true, quoteId: payment.quote_id, projectId: payment.quote_id, paymentType: 'MILESTONE' });
+          }
+
           const qr = await findQuoteRequestById(payment.quote_id);
           if (qr && !qr.depositPaid) {
-            await query('UPDATE payments SET status = ? WHERE stripe_session_id = ?', ['PAID', session_id]);
             await activateDepositAndOpenChat(qr);
           }
-          return res.json({ paid: true, quoteId: payment.quote_id });
+          return res.json({ paid: true, quoteId: payment.quote_id, projectId: payment.quote_id, paymentType: 'DEPOSIT' });
         }
       } catch (_) {}
     }
 
-    return res.json({ paid: payment.status === 'PAID', quoteId: payment.quote_id });
+    return res.json({
+      paid: payment.status === 'PAID',
+      quoteId: payment.quote_id,
+      projectId: payment.quote_id,
+      paymentType: payment.payment_type || 'DEPOSIT'
+    });
   }
 
   const qr = await findQuoteRequestById(quoteId);
@@ -1752,7 +2061,10 @@ app.get('/api/payments/verify', async (req, res) => {
 });
 
 async function activateDepositAndOpenChat(quoteRequest) {
-  await query('UPDATE quote_requests SET deposit_paid = 1, statut = ? WHERE id = ?', ['ACCEPTE', quoteRequest.id]);
+  await query(
+    'UPDATE quote_requests SET deposit_paid = 1, statut = ?, project_status = ?, project_completion_percent = GREATEST(project_completion_percent, 10) WHERE id = ?',
+    ['ACCEPTE', 'IN_PROGRESS', quoteRequest.id]
+  );
 
   const channel = `quote_${quoteRequest.id}`;
   const welcome = {
@@ -1960,6 +2272,950 @@ app.get('/api/google/oauth2/callback', async (req, res) => {
   }
 });
 
+async function buildProjectFolderPayload(project, user) {
+  const [
+    tasksRows,
+    meetingsRows,
+    milestonesRows,
+    reportsRows,
+    deliverablesRows,
+    reportAttachmentsRows
+  ] = await Promise.all([
+    query(
+      `SELECT t.*, u.username AS assigned_employee_name
+       FROM project_tasks t
+       LEFT JOIN users u ON u.id = t.assigned_employee_id
+       WHERE t.project_id = ?
+       ORDER BY FIELD(t.status, 'TO_DO', 'DOING', 'READY'), t.updated_at DESC`,
+      [project.id]
+    ),
+    query(
+      `SELECT m.*, u.username AS client_name, u.email AS client_email
+       FROM meetings m
+       LEFT JOIN users u ON u.id = m.client_user_id
+       WHERE m.project_id = ? OR (m.project_id IS NULL AND m.client_user_id = ?)
+       ORDER BY m.start_date DESC`,
+      [project.id, project.client_id]
+    ),
+    query(
+      `SELECT *
+       FROM project_milestones
+       WHERE project_id = ?
+       ORDER BY order_index ASC, created_at ASC`,
+      [project.id]
+    ),
+    query(
+      `SELECT r.*, u.username AS created_by_name
+       FROM meeting_reports r
+       LEFT JOIN users u ON u.id = r.created_by
+       WHERE r.project_id = ?
+       ORDER BY r.created_at DESC`,
+      [project.id]
+    ),
+    query(
+      `SELECT d.*, u.username AS created_by_name
+       FROM project_deliverables d
+       LEFT JOIN users u ON u.id = d.created_by
+       WHERE d.project_id = ?
+       ORDER BY d.created_at DESC`,
+      [project.id]
+    ),
+    query(
+      `SELECT a.*
+       FROM meeting_report_attachments a
+       INNER JOIN meeting_reports r ON r.id = a.report_id
+       WHERE r.project_id = ?
+       ORDER BY a.created_at DESC`,
+      [project.id]
+    )
+  ]);
+
+  const financial = await getProjectFinancialSummary(project.id);
+  const completedMeetingRows = await query(
+    `SELECT id FROM meetings WHERE project_id = ? AND status = 'COMPLETED' ORDER BY updated_at ASC LIMIT 1`,
+    [project.id]
+  );
+  const hasCompletedKickoffMeeting = completedMeetingRows.length > 0;
+  const canAccessLockedDeliverables = user.role !== 'CLIENT' || financial.paidPercent >= 100;
+
+  const reports = reportsRows.map((report) => ({
+    ...mapMeetingReportRow(report),
+    attachments: reportAttachmentsRows
+      .filter((attachment) => attachment.report_id === report.id)
+      .map((attachment) => ({
+        id: attachment.id,
+        reportId: attachment.report_id,
+        fileUrl: attachment.file_url,
+        fileName: attachment.file_name,
+        createdAt: attachment.created_at
+      }))
+  }));
+
+  const deliverables = deliverablesRows
+    .map(mapDeliverableRow)
+    .filter((item) => user.role !== 'CLIENT' || item.visibleToClient)
+    .map((item) => ({
+      ...item,
+      downloadable: !item.locked || canAccessLockedDeliverables
+    }));
+
+  return {
+    project: mapProjectSummaryRow(project),
+    tasks: tasksRows.map(mapProjectTaskRow),
+    meetings: meetingsRows.map(mapMeetingRow),
+    milestones: milestonesRows.map(mapMilestoneRow),
+    reports,
+    deliverables,
+    paymentProgress: financial,
+    permissions: {
+      canManageWorkflow: canManageProjectWorkflow(user, project),
+      canManageTasks: canManageProjectTasks(user, project),
+      canPayMilestones: user.role === 'CLIENT' && user.id === project.client_id && financial.kickoffPaid,
+      canPayKickoff20: user.role === 'CLIENT' && user.id === project.client_id && financial.depositPaid && !financial.kickoffPaid && hasCompletedKickoffMeeting,
+      canAccessLockedDeliverables
+    }
+  };
+}
+
+app.post('/api/projects/:id/pay-kickoff', auth, authorize('CLIENT'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (project.client_id !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const financial = await getProjectFinancialSummary(project.id);
+  if (!financial.depositPaid) {
+    return res.status(400).json({ message: 'L\'acompte 10% doit etre paye avant le paiement kickoff 20%.' });
+  }
+  if (financial.kickoffPaid) {
+    return res.status(400).json({ message: 'Le paiement kickoff 20% est deja effectue.' });
+  }
+
+  const kickoffMeetingRows = await query(
+    `SELECT id FROM meetings WHERE project_id = ? AND status = 'COMPLETED' ORDER BY updated_at ASC LIMIT 1`,
+    [project.id]
+  );
+  if (!kickoffMeetingRows.length) {
+    return res.status(400).json({ message: 'Le paiement kickoff 20% est disponible apres validation du premier meeting.' });
+  }
+
+  if (!stripe) {
+    return res.status(503).json({ message: 'Le paiement Stripe n\'est pas configure sur le serveur.' });
+  }
+
+  const kickoffAmount = Math.max(1, Math.round((financial.totalCents || 0) * 0.2));
+  const session = await stripe.checkout.sessions.create({
+    payment_method_types: ['card'],
+    mode: 'payment',
+    line_items: [{
+      price_data: {
+        currency: 'eur',
+        product_data: {
+          name: `Kickoff 20% - ${project.service_name || project.service_type || 'Projet'}`,
+          description: `Paiement 20% apres 1er meeting valide pour ${project.id.slice(0, 8)}`
+        },
+        unit_amount: kickoffAmount
+      },
+      quantity: 1
+    }],
+    metadata: {
+      type: 'kickoff20',
+      projectId: project.id,
+      quoteId: project.id
+    },
+    success_url: `${FRONTEND_URL}/paiement/succes?session_id={CHECKOUT_SESSION_ID}&projectId=${project.id}`,
+    cancel_url: `${FRONTEND_URL}/mes-projets/${project.id}`
+  });
+
+  await query(
+    `INSERT INTO payments (
+      id, quote_id, payment_type, stripe_session_id, amount_cents, currency, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [createId('pay'), project.id, 'KICKOFF20', session.id, kickoffAmount, 'EUR', 'PENDING', mysqlNow()]
+  );
+
+  return res.json({ checkoutUrl: session.url, sessionId: session.id });
+});
+
+app.get('/api/projects', auth, async (req, res) => {
+  const { search = '', status = 'ALL', employeeId = 'ALL' } = req.query || {};
+
+  const where = [];
+  const params = [];
+
+  if (req.user.role === 'CLIENT') {
+    where.push('q.client_id = ?');
+    params.push(req.user.id);
+  } else if (req.user.role === 'EMPLOYE') {
+    where.push('q.assigned_employee_id = ?');
+    params.push(req.user.id);
+  }
+
+  if (String(status).trim() && String(status) !== 'ALL') {
+    where.push('(q.statut = ? OR q.project_status = ?)');
+    params.push(String(status).trim(), String(status).trim());
+  }
+
+  if (req.user.role === 'ADMIN' && String(employeeId).trim() && String(employeeId) !== 'ALL') {
+    where.push('q.assigned_employee_id = ?');
+    params.push(String(employeeId).trim());
+  }
+
+  if (String(search).trim()) {
+    const searchToken = `%${String(search).trim()}%`;
+    where.push('(q.id LIKE ? OR q.description LIKE ? OR q.service_type LIKE ? OR c.username LIKE ? OR s.name LIKE ?)');
+    params.push(searchToken, searchToken, searchToken, searchToken, searchToken);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const rows = await query(
+    `SELECT q.*, c.username AS client_username, e.username AS employee_username, s.name AS service_name,
+            COUNT(t.id) AS tasks_total,
+            SUM(CASE WHEN t.status = 'TO_DO' THEN 1 ELSE 0 END) AS tasks_todo,
+            SUM(CASE WHEN t.status = 'DOING' THEN 1 ELSE 0 END) AS tasks_doing,
+            SUM(CASE WHEN t.status = 'READY' THEN 1 ELSE 0 END) AS tasks_ready
+     FROM quote_requests q
+     LEFT JOIN users c ON c.id = q.client_id
+     LEFT JOIN users e ON e.id = q.assigned_employee_id
+     LEFT JOIN services s ON s.id = q.service_id
+     LEFT JOIN project_tasks t ON t.project_id = q.id
+     ${whereSql}
+     GROUP BY q.id
+     ORDER BY q.date_creation DESC`,
+    params
+  );
+
+  return res.json({ projects: rows.map(mapProjectSummaryRow) });
+});
+
+app.get('/api/projects/:id/tasks', auth, async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canAccessProject(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const tasksRows = await query(
+    `SELECT t.*, u.username AS assigned_employee_name
+     FROM project_tasks t
+     LEFT JOIN users u ON u.id = t.assigned_employee_id
+     WHERE t.project_id = ?
+     ORDER BY FIELD(t.status, 'TO_DO', 'DOING', 'READY'), t.updated_at DESC`,
+    [project.id]
+  );
+
+  const meetingsRows = await query(
+    `SELECT id, title, start_date, end_date, status
+     FROM meetings
+     WHERE client_user_id = ?
+     ORDER BY start_date DESC`,
+    [project.client_id]
+  );
+
+  let assignees = [];
+  if (req.user.role === 'ADMIN') {
+    const employeesRows = await query(
+      `SELECT id, username, email
+       FROM users
+       WHERE role = 'EMPLOYE' AND suspended = 0
+       ORDER BY username ASC`
+    );
+    assignees = employeesRows.map((row) => ({ id: row.id, username: row.username, email: row.email }));
+  } else if (req.user.role === 'EMPLOYE') {
+    const me = await findUserById(req.user.id);
+    assignees = me ? [{ id: me.id, username: me.username, email: me.email }] : [];
+  }
+
+  return res.json({
+    project: mapProjectSummaryRow({
+      ...project,
+      tasks_total: tasksRows.length,
+      tasks_todo: tasksRows.filter((task) => task.status === 'TO_DO').length,
+      tasks_doing: tasksRows.filter((task) => task.status === 'DOING').length,
+      tasks_ready: tasksRows.filter((task) => task.status === 'READY').length
+    }),
+    tasks: tasksRows.map(mapProjectTaskRow),
+    assignees,
+    meetings: meetingsRows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      start: row.start_date,
+      end: row.end_date,
+      status: row.status
+    }))
+  });
+});
+
+app.get('/api/projects/:id', auth, async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canAccessProject(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const folder = await buildProjectFolderPayload(project, req.user);
+  return res.json(folder);
+});
+
+app.post('/api/projects/:id/milestones', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const { title, description, amountCents, percent, dueDate, totalMilestonesCount } = req.body || {};
+  if (!title) {
+    return res.status(400).json({ message: 'title est requis.' });
+  }
+
+  const quote = await findQuoteRequestById(project.id);
+  const estimateAmount = Number(quote?.finalEstimation?.amount || 0);
+  const existingMilestonesRows = await query('SELECT COUNT(*) AS total FROM project_milestones WHERE project_id = ?', [project.id]);
+  const existingCount = Number(existingMilestonesRows[0]?.total || 0);
+  const expectedMilestonesCount = Math.max(existingCount + 1, Number(totalMilestonesCount || existingCount + 1));
+  const computedAmount = amountCents
+    ? Number(amountCents)
+    : (percent
+      ? Math.round((estimateAmount * (Number(percent) || 0) / 100) * 100)
+      : Math.round((estimateAmount * 0.7 * 100) / expectedMilestonesCount));
+
+  if (!computedAmount || computedAmount <= 0) {
+    return res.status(400).json({ message: 'Montant de milestone invalide.' });
+  }
+
+  const orderRows = await query('SELECT COALESCE(MAX(order_index), 0) AS max_order FROM project_milestones WHERE project_id = ?', [project.id]);
+  const milestoneId = createId('mil');
+  const now = mysqlNow();
+  let normalizedDueDate = null;
+  if (dueDate) {
+    const parsedDueDate = parseDateInput(dueDate);
+    if (!parsedDueDate) return res.status(400).json({ message: 'dueDate invalide.' });
+    normalizedDueDate = parsedDueDate.toISOString().slice(0, 19).replace('T', ' ');
+  }
+
+  await query(
+    `INSERT INTO project_milestones (
+      id, project_id, title, description, amount_cents, percent, order_index, status, due_date,
+      created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      milestoneId,
+      project.id,
+      String(title).trim(),
+      description ? String(description).trim() : '',
+      Math.round(computedAmount),
+      Number(percent || 0),
+      Number(orderRows[0]?.max_order || 0) + 1,
+      'CREATED',
+      normalizedDueDate,
+      req.user.id,
+      now,
+      now
+    ]
+  );
+
+  await query(
+    'UPDATE quote_requests SET project_status = ?, statut = CASE WHEN statut = ? THEN ? ELSE statut END WHERE id = ?',
+    ['IN_PROGRESS', 'ACCEPTE', 'ACCEPTE', project.id]
+  );
+
+  const rows = await query('SELECT * FROM project_milestones WHERE id = ? LIMIT 1', [milestoneId]);
+  return res.status(201).json({ milestone: mapMilestoneRow(rows[0]) });
+});
+
+app.put('/api/projects/:id/milestones/:milestoneId', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const milestoneRows = await query(
+    'SELECT * FROM project_milestones WHERE id = ? AND project_id = ? LIMIT 1',
+    [req.params.milestoneId, project.id]
+  );
+  const milestone = milestoneRows[0];
+  if (!milestone) return res.status(404).json({ message: 'Milestone introuvable.' });
+  if (milestone.status === 'PAID') {
+    return res.status(400).json({ message: 'Impossible de modifier un milestone deja paye.' });
+  }
+
+  const nextTitle = req.body?.title ? String(req.body.title).trim() : milestone.title;
+  if (!nextTitle) return res.status(400).json({ message: 'title est requis.' });
+
+  const nextDescription = req.body?.description !== undefined
+    ? String(req.body.description || '').trim()
+    : (milestone.description || '');
+
+  const nextAmountCents = req.body?.amountCents !== undefined
+    ? Number(req.body.amountCents)
+    : Number(milestone.amount_cents || 0);
+  if (!nextAmountCents || nextAmountCents <= 0) {
+    return res.status(400).json({ message: 'Montant milestone invalide.' });
+  }
+
+  let nextDueDate = milestone.due_date || null;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'dueDate')) {
+    if (!req.body.dueDate) {
+      nextDueDate = null;
+    } else {
+      const parsedDueDate = parseDateInput(req.body.dueDate);
+      if (!parsedDueDate) return res.status(400).json({ message: 'dueDate invalide.' });
+      nextDueDate = parsedDueDate.toISOString().slice(0, 19).replace('T', ' ');
+    }
+  }
+
+  await query(
+    `UPDATE project_milestones
+     SET title = ?, description = ?, amount_cents = ?, due_date = ?, updated_at = ?
+     WHERE id = ? AND project_id = ?`,
+    [nextTitle, nextDescription, Math.round(nextAmountCents), nextDueDate, mysqlNow(), milestone.id, project.id]
+  );
+
+  const updatedRows = await query('SELECT * FROM project_milestones WHERE id = ? LIMIT 1', [milestone.id]);
+  return res.json({ milestone: mapMilestoneRow(updatedRows[0]) });
+});
+
+app.delete('/api/projects/:id/milestones/:milestoneId', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const milestoneRows = await query(
+    'SELECT * FROM project_milestones WHERE id = ? AND project_id = ? LIMIT 1',
+    [req.params.milestoneId, project.id]
+  );
+  const milestone = milestoneRows[0];
+  if (!milestone) return res.status(404).json({ message: 'Milestone introuvable.' });
+  if (['PAID', 'PENDING'].includes(milestone.status)) {
+    return res.status(400).json({ message: 'Impossible de supprimer un milestone deja paye ou en cours de paiement.' });
+  }
+
+  await query('UPDATE project_tasks SET milestone_id = NULL, updated_at = ? WHERE milestone_id = ?', [mysqlNow(), milestone.id]);
+  await query('DELETE FROM project_milestones WHERE id = ? AND project_id = ?', [milestone.id, project.id]);
+
+  return res.json({ success: true });
+});
+
+app.post('/api/projects/:id/milestones/:milestoneId/pay', auth, authorize('CLIENT'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (project.client_id !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const milestoneRows = await query(
+    'SELECT * FROM project_milestones WHERE id = ? AND project_id = ? LIMIT 1',
+    [req.params.milestoneId, project.id]
+  );
+  const milestone = milestoneRows[0];
+  if (!milestone) return res.status(404).json({ message: 'Milestone introuvable.' });
+  if (milestone.status === 'PAID') return res.status(400).json({ message: 'Ce milestone est deja paye.' });
+  if (milestone.status !== 'READY_FOR_PAYMENT') {
+    return res.status(400).json({ message: 'Le milestone n\'est pas encore valide pour paiement.' });
+  }
+
+  const financial = await getProjectFinancialSummary(project.id);
+  if (!financial.kickoffPaid) {
+    return res.status(400).json({ message: 'Le paiement kickoff 20% doit etre effectue avant les paiements milestones.' });
+  }
+  if (!stripe) return res.status(503).json({ message: 'Le paiement Stripe n\'est pas configure sur le serveur.' });
+
+  const session = await stripe.checkout.sessions.create({
+    payment_method_types: ['card'],
+    mode: 'payment',
+    line_items: [{
+      price_data: {
+        currency: 'eur',
+        product_data: {
+          name: `Milestone - ${milestone.title}`,
+          description: `Paiement milestone pour le projet ${project.id.slice(0, 8)}`
+        },
+        unit_amount: Number(milestone.amount_cents || 0)
+      },
+      quantity: 1
+    }],
+    metadata: {
+      type: 'milestone',
+      projectId: project.id,
+      milestoneId: milestone.id,
+      quoteId: project.id
+    },
+    success_url: `${FRONTEND_URL}/paiement/succes?session_id={CHECKOUT_SESSION_ID}&projectId=${project.id}`,
+    cancel_url: `${FRONTEND_URL}/mes-projets/${project.id}`
+  });
+
+  await query(
+    `INSERT INTO payments (
+      id, quote_id, milestone_id, payment_type, stripe_session_id, amount_cents, currency, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [createId('pay'), project.id, milestone.id, 'MILESTONE', session.id, Number(milestone.amount_cents || 0), 'EUR', 'PENDING', mysqlNow()]
+  );
+
+  await query('UPDATE project_milestones SET status = ?, updated_at = ? WHERE id = ?', ['PENDING', mysqlNow(), milestone.id]);
+  return res.json({ checkoutUrl: session.url, sessionId: session.id });
+});
+
+app.put('/api/projects/:id/milestones/:milestoneId/ready', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const { validationMeetingId } = req.body || {};
+  if (!validationMeetingId) {
+    return res.status(400).json({ message: 'validationMeetingId est requis.' });
+  }
+
+  const milestoneRows = await query('SELECT * FROM project_milestones WHERE id = ? AND project_id = ? LIMIT 1', [req.params.milestoneId, project.id]);
+  const milestone = milestoneRows[0];
+  if (!milestone) return res.status(404).json({ message: 'Milestone introuvable.' });
+
+  const meetingRows = await query('SELECT * FROM meetings WHERE id = ? AND project_id = ? LIMIT 1', [validationMeetingId, project.id]);
+  const meeting = meetingRows[0];
+  if (!meeting) return res.status(404).json({ message: 'Meeting de validation introuvable pour ce projet.' });
+  if (meeting.status !== 'COMPLETED') {
+    return res.status(400).json({ message: 'Le meeting de validation doit etre complete avant activation du paiement milestone.' });
+  }
+
+  await query(
+    `UPDATE project_milestones
+     SET status = 'READY_FOR_PAYMENT', validation_meeting_id = ?, updated_at = ?
+     WHERE id = ? AND project_id = ?`,
+    [meeting.id, mysqlNow(), milestone.id, project.id]
+  );
+
+  const updatedRows = await query('SELECT * FROM project_milestones WHERE id = ? LIMIT 1', [milestone.id]);
+  return res.json({ milestone: mapMilestoneRow(updatedRows[0]) });
+});
+
+app.put('/api/meetings/:id/complete', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const rows = await query('SELECT * FROM meetings WHERE id = ? LIMIT 1', [req.params.id]);
+  const meeting = rows[0];
+  if (!meeting) return res.status(404).json({ message: 'Meeting introuvable.' });
+
+  const project = await resolveProjectFromMeeting(meeting, req.body?.projectId || null);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  if (meeting.status === 'COMPLETED') {
+    return res.json({ success: true, alreadyCompleted: true });
+  }
+
+  await query('UPDATE meetings SET status = ?, updated_at = ? WHERE id = ?', ['COMPLETED', mysqlNow(), meeting.id]);
+  await query('UPDATE quote_requests SET project_status = ? WHERE id = ?', ['REVIEW', project.id]);
+
+  return res.json({ success: true });
+});
+
+app.post('/api/meetings/:id/report', auth, authorize('ADMIN', 'EMPLOYE'), uploadFile.array('attachments', 10), async (req, res) => {
+  const rows = await query('SELECT * FROM meetings WHERE id = ? LIMIT 1', [req.params.id]);
+  const meeting = rows[0];
+  if (!meeting) return res.status(404).json({ message: 'Meeting introuvable.' });
+
+  const project = await resolveProjectFromMeeting(meeting, req.body?.projectId || null);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const { summary, decisions, blockers, actionItems, nextSteps } = req.body || {};
+  if (!summary || !String(summary).trim()) {
+    return res.status(400).json({ message: 'summary requis.' });
+  }
+
+  const reportId = createId('rpt');
+  const now = mysqlNow();
+  await query(
+    `INSERT INTO meeting_reports (
+      id, meeting_id, project_id, summary, decisions_json, blockers_json, action_items_json, next_steps_json,
+      created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      reportId,
+      meeting.id,
+      project.id,
+      String(summary).trim(),
+      JSON.stringify(normalizeStringList(decisions)),
+      JSON.stringify(normalizeStringList(blockers)),
+      JSON.stringify(normalizeStringList(actionItems)),
+      JSON.stringify(normalizeStringList(nextSteps)),
+      req.user.id,
+      now,
+      now
+    ]
+  );
+
+  if ((req.files || []).length) {
+    for (const file of req.files) {
+      await query(
+        `INSERT INTO meeting_report_attachments (id, report_id, file_url, file_name, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [createId('att'), reportId, toPublicUploadUrl(req, file.filename), file.originalname, mysqlNow()]
+      );
+    }
+  }
+
+  await query('UPDATE quote_requests SET project_status = ? WHERE id = ?', ['IN_PROGRESS', project.id]);
+
+  const reportRows = await query(
+    `SELECT r.*, u.username AS created_by_name
+     FROM meeting_reports r
+     LEFT JOIN users u ON u.id = r.created_by
+     WHERE r.id = ? LIMIT 1`,
+    [reportId]
+  );
+  return res.status(201).json({ report: mapMeetingReportRow(reportRows[0]) });
+});
+
+app.post('/api/meetings/:id/next', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const rows = await query('SELECT * FROM meetings WHERE id = ? LIMIT 1', [req.params.id]);
+  const previousMeeting = rows[0];
+  if (!previousMeeting) return res.status(404).json({ message: 'Meeting source introuvable.' });
+
+  const project = await resolveProjectFromMeeting(previousMeeting, req.body?.projectId || null);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const { title, description, start, end, timezone } = req.body || {};
+  if (!title || !start || !end) {
+    return res.status(400).json({ message: 'title, start et end sont requis.' });
+  }
+
+  const organizer = await findUserById(req.user.id);
+  const client = await findUserById(project.client_id);
+  if (!organizer?.email || !client?.email) return res.status(400).json({ message: 'Participants introuvables.' });
+
+  const startDate = parseDateInput(start);
+  const endDate = parseDateInput(end);
+  if (!startDate || !endDate || endDate <= startDate) {
+    return res.status(400).json({ message: 'Dates invalides.' });
+  }
+
+  const meetingId = createId('meet');
+  const tz = timezone || 'Europe/Paris';
+  const startSql = startDate.toISOString().slice(0, 19).replace('T', ' ');
+  const endSql = endDate.toISOString().slice(0, 19).replace('T', ' ');
+
+  await query(
+    `INSERT INTO meetings (
+      id, project_id, title, description, start_date, end_date, timezone, created_by, client_user_id,
+      status, sync_status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [meetingId, project.id, String(title).trim(), description ? String(description).trim() : '', startSql, endSql, tz, req.user.id, project.client_id, 'SCHEDULED', 'PENDING', mysqlNow(), mysqlNow()]
+  );
+
+  try {
+    const attendeeEmails = [...new Set([organizer.email, client.email])];
+    const { googleEventId, meetLink } = await createGoogleMeetingEvent({
+      title: String(title).trim(),
+      description: description ? String(description).trim() : '',
+      startIso: startDate.toISOString(),
+      endIso: endDate.toISOString(),
+      timezone: tz,
+      attendeeEmails,
+      requestId: `${meetingId}_${Date.now()}`
+    });
+
+    await query('UPDATE meetings SET google_event_id = ?, meet_link = ?, sync_status = ?, updated_at = ? WHERE id = ?', [googleEventId, meetLink, 'SYNCED', mysqlNow(), meetingId]);
+  } catch (error) {
+    await query('UPDATE meetings SET sync_status = ?, last_sync_error = ?, updated_at = ? WHERE id = ?', ['FAILED', error.message || 'Erreur de synchronisation Google Calendar', mysqlNow(), meetingId]);
+    return res.status(502).json({ message: error.message || 'Impossible de creer la reunion Google Meet.' });
+  }
+
+  const meetingRows = await query(
+    `SELECT m.*, u.username AS client_name, u.email AS client_email
+     FROM meetings m
+     LEFT JOIN users u ON u.id = m.client_user_id
+     WHERE m.id = ? LIMIT 1`,
+    [meetingId]
+  );
+  return res.status(201).json({ event: mapMeetingRow(meetingRows[0]) });
+});
+
+app.post('/api/projects/:id/deliverables', auth, authorize('ADMIN', 'EMPLOYE'), uploadFile.single('file'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const { title, description, visibleToClient } = req.body || {};
+  if (!title || !req.file) return res.status(400).json({ message: 'title et file sont requis.' });
+
+  const financial = await getProjectFinancialSummary(project.id);
+  const lockByDefault = financial.paidPercent < 100;
+
+  const deliverableId = createId('dlv');
+  await query(
+    `INSERT INTO project_deliverables (
+      id, project_id, title, description, file_url, file_name, locked, visible_to_client,
+      created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      deliverableId,
+      project.id,
+      String(title).trim(),
+      description ? String(description).trim() : '',
+      toPublicUploadUrl(req, req.file.filename),
+      req.file.originalname,
+      lockByDefault ? 1 : 0,
+      typeof visibleToClient === 'string' ? (visibleToClient === 'true' ? 1 : 0) : 1,
+      req.user.id,
+      mysqlNow(),
+      mysqlNow()
+    ]
+  );
+
+  const rowsDeliverables = await query(
+    `SELECT d.*, u.username AS created_by_name
+     FROM project_deliverables d
+     LEFT JOIN users u ON u.id = d.created_by
+     WHERE d.id = ? LIMIT 1`,
+    [deliverableId]
+  );
+
+  return res.status(201).json({ deliverable: mapDeliverableRow(rowsDeliverables[0]) });
+});
+
+app.get('/api/projects/:id/deliverables/:deliverableId/download', auth, async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canAccessProject(req.user, project)) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const rows = await query(
+    'SELECT * FROM project_deliverables WHERE id = ? AND project_id = ? LIMIT 1',
+    [req.params.deliverableId, project.id]
+  );
+  const deliverable = rows[0];
+  if (!deliverable) return res.status(404).json({ message: 'Livrable introuvable.' });
+
+  const financial = await getProjectFinancialSummary(project.id);
+  const canDownload = !deliverable.locked || req.user.role !== 'CLIENT' || financial.paidPercent >= 100;
+  if (!canDownload) {
+    return res.status(403).json({ message: 'Paiement complet requis pour telecharger ce livrable.' });
+  }
+
+  return res.json({ url: deliverable.file_url, fileName: deliverable.file_name });
+});
+
+app.post('/api/tasks', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const { projectId, title, description, status, assignedEmployeeId, meetingId, milestoneId, deadline } = req.body || {};
+
+  if (!projectId || !title || !assignedEmployeeId) {
+    return res.status(400).json({ message: 'projectId, title et assignedEmployeeId sont requis.' });
+  }
+
+  const normalizedStatus = status && ['TO_DO', 'DOING', 'READY'].includes(status) ? status : 'TO_DO';
+  const project = await findProjectById(projectId);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectTasks(req.user, project)) return res.status(403).json({ message: 'Acces interdit pour ce projet.' });
+
+  const assignee = await findUserById(assignedEmployeeId);
+  if (!assignee || assignee.role !== 'EMPLOYE' || assignee.suspended) {
+    return res.status(400).json({ message: 'Employe assigne invalide.' });
+  }
+
+  if (req.user.role === 'EMPLOYE' && assignee.id !== req.user.id) {
+    return res.status(403).json({ message: 'Vous ne pouvez assigner une tache qu\'a vous-meme.' });
+  }
+
+  let normalizedMeetingId = null;
+  if (meetingId) {
+    const meetingRows = await query('SELECT * FROM meetings WHERE id = ? LIMIT 1', [meetingId]);
+    const meeting = meetingRows[0];
+    if (!meeting) return res.status(404).json({ message: 'Meeting de reference introuvable.' });
+    if (meeting.client_user_id !== project.client_id) {
+      return res.status(400).json({ message: 'Le meeting doit appartenir au meme client que le projet.' });
+    }
+    normalizedMeetingId = meeting.id;
+  }
+
+  let normalizedMilestoneId = null;
+  if (milestoneId) {
+    const milestoneRows = await query('SELECT * FROM project_milestones WHERE id = ? AND project_id = ? LIMIT 1', [milestoneId, project.id]);
+    if (!milestoneRows[0]) return res.status(404).json({ message: 'Milestone de reference introuvable.' });
+    normalizedMilestoneId = milestoneId;
+  }
+
+  let normalizedDeadline = null;
+  if (deadline) {
+    const parsedDeadline = parseDateInput(deadline);
+    if (!parsedDeadline) return res.status(400).json({ message: 'Deadline invalide.' });
+    normalizedDeadline = parsedDeadline.toISOString().slice(0, 19).replace('T', ' ');
+  }
+
+  const taskId = createId('tsk');
+  const now = mysqlNow();
+  await query(
+    `INSERT INTO project_tasks (
+      id, project_id, title, description, status, assigned_employee_id, meeting_id, milestone_id, deadline, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      taskId,
+      project.id,
+      String(title).trim(),
+      description ? String(description).trim() : '',
+      normalizedStatus,
+      assignee.id,
+      normalizedMeetingId,
+      normalizedMilestoneId,
+      normalizedDeadline,
+      req.user.id,
+      now,
+      now
+    ]
+  );
+
+  const createdRows = await query(
+    `SELECT t.*, u.username AS assigned_employee_name
+     FROM project_tasks t
+     LEFT JOIN users u ON u.id = t.assigned_employee_id
+     WHERE t.id = ? LIMIT 1`,
+    [taskId]
+  );
+
+  return res.status(201).json({ task: mapProjectTaskRow(createdRows[0]) });
+});
+
+app.put('/api/tasks/:id', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const taskRows = await query('SELECT * FROM project_tasks WHERE id = ? LIMIT 1', [req.params.id]);
+  const task = taskRows[0];
+  if (!task) return res.status(404).json({ message: 'Tache introuvable.' });
+
+  const project = await findProjectById(task.project_id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectTasks(req.user, project)) return res.status(403).json({ message: 'Acces interdit pour ce projet.' });
+
+  const nextTitle = req.body?.title ? String(req.body.title).trim() : task.title;
+  const nextDescription = req.body?.description !== undefined ? String(req.body.description || '').trim() : (task.description || '');
+  const nextStatus = req.body?.status && ['TO_DO', 'DOING', 'READY'].includes(req.body.status) ? req.body.status : task.status;
+  const nextAssigneeId = req.body?.assignedEmployeeId || task.assigned_employee_id;
+
+  const assignee = await findUserById(nextAssigneeId);
+  if (!assignee || assignee.role !== 'EMPLOYE' || assignee.suspended) {
+    return res.status(400).json({ message: 'Employe assigne invalide.' });
+  }
+  if (req.user.role === 'EMPLOYE' && assignee.id !== req.user.id) {
+    return res.status(403).json({ message: 'Vous ne pouvez assigner une tache qu\'a vous-meme.' });
+  }
+
+  let nextMeetingId = task.meeting_id || null;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'meetingId')) {
+    if (!req.body.meetingId) {
+      nextMeetingId = null;
+    } else {
+      const meetingRows = await query('SELECT * FROM meetings WHERE id = ? LIMIT 1', [req.body.meetingId]);
+      const meeting = meetingRows[0];
+      if (!meeting) return res.status(404).json({ message: 'Meeting de reference introuvable.' });
+      if (meeting.client_user_id !== project.client_id) {
+        return res.status(400).json({ message: 'Le meeting doit appartenir au meme client que le projet.' });
+      }
+      nextMeetingId = meeting.id;
+    }
+  }
+
+  let nextMilestoneId = task.milestone_id || null;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'milestoneId')) {
+    if (!req.body.milestoneId) {
+      nextMilestoneId = null;
+    } else {
+      const milestoneRows = await query('SELECT * FROM project_milestones WHERE id = ? AND project_id = ? LIMIT 1', [req.body.milestoneId, project.id]);
+      if (!milestoneRows[0]) return res.status(404).json({ message: 'Milestone de reference introuvable.' });
+      nextMilestoneId = req.body.milestoneId;
+    }
+  }
+
+  let nextDeadline = task.deadline || null;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'deadline')) {
+    if (!req.body.deadline) {
+      nextDeadline = null;
+    } else {
+      const parsedDeadline = parseDateInput(req.body.deadline);
+      if (!parsedDeadline) return res.status(400).json({ message: 'Deadline invalide.' });
+      nextDeadline = parsedDeadline.toISOString().slice(0, 19).replace('T', ' ');
+    }
+  }
+
+  await query(
+    `UPDATE project_tasks
+     SET title = ?, description = ?, status = ?, assigned_employee_id = ?, meeting_id = ?, milestone_id = ?, deadline = ?, updated_at = ?
+     WHERE id = ?`,
+    [nextTitle, nextDescription, nextStatus, assignee.id, nextMeetingId, nextMilestoneId, nextDeadline, mysqlNow(), task.id]
+  );
+
+  const updatedRows = await query(
+    `SELECT t.*, u.username AS assigned_employee_name
+     FROM project_tasks t
+     LEFT JOIN users u ON u.id = t.assigned_employee_id
+     WHERE t.id = ? LIMIT 1`,
+    [task.id]
+  );
+
+  return res.json({ task: mapProjectTaskRow(updatedRows[0]) });
+});
+
+app.delete('/api/tasks/:id', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const taskRows = await query('SELECT * FROM project_tasks WHERE id = ? LIMIT 1', [req.params.id]);
+  const task = taskRows[0];
+  if (!task) return res.status(404).json({ message: 'Tache introuvable.' });
+
+  const project = await findProjectById(task.project_id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectTasks(req.user, project)) return res.status(403).json({ message: 'Acces interdit pour ce projet.' });
+
+  await query('DELETE FROM project_tasks WHERE id = ?', [task.id]);
+  return res.json({ success: true });
+});
+
+app.put('/api/tasks/:id/status', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  const { status } = req.body || {};
+  if (!['TO_DO', 'DOING', 'READY'].includes(status)) {
+    return res.status(400).json({ message: 'status doit etre TO_DO, DOING ou READY.' });
+  }
+
+  const taskRows = await query('SELECT * FROM project_tasks WHERE id = ? LIMIT 1', [req.params.id]);
+  const task = taskRows[0];
+  if (!task) return res.status(404).json({ message: 'Tache introuvable.' });
+
+  const project = await findProjectById(task.project_id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (!canManageProjectTasks(req.user, project)) return res.status(403).json({ message: 'Acces interdit pour ce projet.' });
+
+  await query('UPDATE project_tasks SET status = ?, updated_at = ? WHERE id = ?', [status, mysqlNow(), task.id]);
+
+  const updatedRows = await query(
+    `SELECT t.*, u.username AS assigned_employee_name
+     FROM project_tasks t
+     LEFT JOIN users u ON u.id = t.assigned_employee_id
+     WHERE t.id = ? LIMIT 1`,
+    [task.id]
+  );
+  return res.json({ task: mapProjectTaskRow(updatedRows[0]) });
+});
+
+app.get('/api/events/paid-projects', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
+  let rows;
+  if (req.user.role === 'EMPLOYE') {
+    rows = await query(
+      `SELECT q.id, q.service_type, q.deposit_paid, q.client_id,
+              c.username AS client_name, c.email AS client_email, s.name AS service_name
+       FROM quote_requests q
+       LEFT JOIN users c ON c.id = q.client_id
+       LEFT JOIN services s ON s.id = q.service_id
+       WHERE q.assigned_employee_id = ? AND q.deposit_paid = 1
+       ORDER BY q.date_creation DESC`,
+      [req.user.id]
+    );
+  } else {
+    rows = await query(
+      `SELECT q.id, q.service_type, q.deposit_paid, q.client_id,
+              c.username AS client_name, c.email AS client_email, s.name AS service_name
+       FROM quote_requests q
+       LEFT JOIN users c ON c.id = q.client_id
+       LEFT JOIN services s ON s.id = q.service_id
+       WHERE q.deposit_paid = 1
+       ORDER BY q.date_creation DESC`
+    );
+  }
+
+  return res.json({
+    projects: rows.map((row) => ({
+      id: row.id,
+      name: row.service_name || row.service_type || 'Projet',
+      clientId: row.client_id,
+      clientName: row.client_name || null,
+      clientEmail: row.client_email || null
+    }))
+  });
+});
+
 app.get('/api/events/participants', auth, authorize('ADMIN', 'EMPLOYE'), async (_req, res) => {
   const rows = await query(
     'SELECT id, username, email FROM users WHERE role = ? AND suspended = 0 ORDER BY username ASC',
@@ -2001,7 +3257,7 @@ app.get('/api/events', auth, async (req, res) => {
 });
 
 app.post('/api/events', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
-  const { title, description, start, end, timezone, clientUserId } = req.body || {};
+  const { title, description, start, end, timezone, clientUserId, projectId } = req.body || {};
   if (!title || !start || !end || !clientUserId) {
     return res.status(400).json({ message: 'title, start, end, clientUserId requis.' });
   }
@@ -2022,12 +3278,23 @@ app.post('/api/events', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) =>
   const startSql = startDate.toISOString().slice(0, 19).replace('T', ' ');
   const endSql = endDate.toISOString().slice(0, 19).replace('T', ' ');
 
+  let normalizedProjectId = null;
+  if (projectId) {
+    const project = await findProjectById(projectId);
+    if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+    if (!canManageProjectWorkflow(req.user, project)) return res.status(403).json({ message: 'Acces interdit pour ce projet.' });
+    if (project.client_id !== client.id) {
+      return res.status(400).json({ message: 'Le client du meeting ne correspond pas au client du projet.' });
+    }
+    normalizedProjectId = project.id;
+  }
+
   await query(
     `INSERT INTO meetings (
-      id, title, description, start_date, end_date, timezone, created_by, client_user_id,
+      id, project_id, title, description, start_date, end_date, timezone, created_by, client_user_id,
       status, sync_status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [eventId, String(title).trim(), description ? String(description).trim() : '', startSql, endSql, tz, req.user.id, client.id, 'SCHEDULED', 'PENDING', mysqlNow(), mysqlNow()]
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [eventId, normalizedProjectId, String(title).trim(), description ? String(description).trim() : '', startSql, endSql, tz, req.user.id, client.id, 'SCHEDULED', 'PENDING', mysqlNow(), mysqlNow()]
   );
 
   try {
@@ -2077,6 +3344,7 @@ app.put('/api/events/:id', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res)
   const canEdit = req.user.role === 'ADMIN' || event.created_by === req.user.id;
   if (!canEdit) return res.status(403).json({ message: 'Acces interdit.' });
   if (event.status === 'CANCELED') return res.status(400).json({ message: 'Evenement deja annule.' });
+  if (event.status === 'COMPLETED') return res.status(400).json({ message: 'Evenement deja termine.' });
 
   const nextTitle = req.body?.title ? String(req.body.title).trim() : event.title;
   const nextDescription = req.body?.description !== undefined ? String(req.body.description || '').trim() : (event.description || '');
@@ -2169,6 +3437,7 @@ app.delete('/api/events/:id', auth, authorize('ADMIN', 'EMPLOYE'), async (req, r
   const canDelete = req.user.role === 'ADMIN' || event.created_by === req.user.id;
   if (!canDelete) return res.status(403).json({ message: 'Acces interdit.' });
   if (event.status === 'CANCELED') return res.json({ success: true, alreadyCanceled: true });
+  if (event.status === 'COMPLETED') return res.status(400).json({ message: 'Impossible d\'annuler un meeting termine.' });
 
   await query(
     'UPDATE meetings SET status = ?, sync_status = ?, updated_at = ? WHERE id = ?',
@@ -2330,20 +3599,28 @@ async function bootstrapMySql() {
   await ensureColumnIfMissing('quote_requests', 'client_seen_at', 'DATETIME NULL');
   await ensureColumnIfMissing('quote_requests', 'client_response', 'VARCHAR(20) NULL');
   await ensureColumnIfMissing('quote_requests', 'deposit_paid', 'TINYINT(1) NOT NULL DEFAULT 0');
+  await ensureColumnIfMissing('quote_requests', 'kickoff_paid', 'TINYINT(1) NOT NULL DEFAULT 0');
+  await ensureColumnIfMissing('quote_requests', 'project_status', "VARCHAR(30) NOT NULL DEFAULT 'NOT_STARTED'");
+  await ensureColumnIfMissing('quote_requests', 'project_completion_percent', 'INT NOT NULL DEFAULT 0');
 
   await query(`
     CREATE TABLE IF NOT EXISTS payments (
       id VARCHAR(64) PRIMARY KEY,
       quote_id VARCHAR(64) NOT NULL,
+      milestone_id VARCHAR(64) NULL,
+      payment_type VARCHAR(20) NOT NULL DEFAULT 'DEPOSIT',
       stripe_session_id VARCHAR(255) NULL,
       amount_cents INT NOT NULL,
       currency VARCHAR(10) NOT NULL DEFAULT 'EUR',
       status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
       created_at DATETIME NOT NULL,
       INDEX idx_pay_quote (quote_id),
+      INDEX idx_pay_milestone (milestone_id),
       INDEX idx_pay_session (stripe_session_id)
     )
   `);
+  await ensureColumnIfMissing('payments', 'milestone_id', 'VARCHAR(64) NULL');
+  await ensureColumnIfMissing('payments', 'payment_type', "VARCHAR(20) NOT NULL DEFAULT 'DEPOSIT'");
 
   await query(`
     CREATE TABLE IF NOT EXISTS notifications (
@@ -2437,6 +3714,7 @@ async function bootstrapMySql() {
   await query(`
     CREATE TABLE IF NOT EXISTS meetings (
       id VARCHAR(64) PRIMARY KEY,
+      project_id VARCHAR(64) NULL,
       title VARCHAR(255) NOT NULL,
       description TEXT NULL,
       start_date DATETIME NOT NULL,
@@ -2446,17 +3724,118 @@ async function bootstrapMySql() {
       client_user_id VARCHAR(64) NOT NULL,
       google_event_id VARCHAR(255) NULL,
       meet_link TEXT NULL,
-      status ENUM('SCHEDULED', 'CANCELED') NOT NULL DEFAULT 'SCHEDULED',
+      status ENUM('SCHEDULED', 'COMPLETED', 'CANCELED') NOT NULL DEFAULT 'SCHEDULED',
       sync_status ENUM('PENDING', 'SYNCED', 'FAILED') NOT NULL DEFAULT 'PENDING',
       last_sync_error TEXT NULL,
       created_at DATETIME NOT NULL,
       updated_at DATETIME NOT NULL,
+      INDEX idx_meetings_project (project_id),
       INDEX idx_meetings_start (start_date),
       INDEX idx_meetings_client (client_user_id),
       INDEX idx_meetings_creator (created_by),
       UNIQUE KEY uq_meetings_google_event (google_event_id)
     )
   `);
+  await ensureColumnIfMissing('meetings', 'project_id', 'VARCHAR(64) NULL');
+  await query(
+    "ALTER TABLE meetings MODIFY COLUMN status ENUM('SCHEDULED', 'COMPLETED', 'CANCELED') NOT NULL DEFAULT 'SCHEDULED'"
+  ).catch(() => {});
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS project_milestones (
+      id VARCHAR(64) PRIMARY KEY,
+      project_id VARCHAR(64) NOT NULL,
+      title VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      amount_cents INT NOT NULL,
+      percent DECIMAL(6,2) NOT NULL DEFAULT 0,
+      order_index INT NOT NULL DEFAULT 1,
+      status ENUM('CREATED', 'READY_FOR_PAYMENT', 'PENDING', 'PAID', 'FAILED') NOT NULL DEFAULT 'CREATED',
+      validation_meeting_id VARCHAR(64) NULL,
+      due_date DATETIME NULL,
+      paid_at DATETIME NULL,
+      payment_id VARCHAR(255) NULL,
+      created_by VARCHAR(64) NOT NULL,
+      created_at DATETIME NOT NULL,
+      updated_at DATETIME NOT NULL,
+      INDEX idx_milestones_project (project_id),
+      INDEX idx_milestones_status (status),
+      INDEX idx_milestones_validation_meeting (validation_meeting_id)
+    )
+  `);
+  await ensureColumnIfMissing('project_milestones', 'validation_meeting_id', 'VARCHAR(64) NULL');
+  await query(
+    "ALTER TABLE project_milestones MODIFY COLUMN status ENUM('CREATED', 'READY_FOR_PAYMENT', 'PENDING', 'PAID', 'FAILED') NOT NULL DEFAULT 'CREATED'"
+  ).catch(() => {});
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS meeting_reports (
+      id VARCHAR(64) PRIMARY KEY,
+      meeting_id VARCHAR(64) NOT NULL,
+      project_id VARCHAR(64) NOT NULL,
+      summary TEXT NOT NULL,
+      decisions_json LONGTEXT NULL,
+      blockers_json LONGTEXT NULL,
+      action_items_json LONGTEXT NULL,
+      next_steps_json LONGTEXT NULL,
+      created_by VARCHAR(64) NOT NULL,
+      created_at DATETIME NOT NULL,
+      updated_at DATETIME NOT NULL,
+      INDEX idx_reports_project (project_id),
+      INDEX idx_reports_meeting (meeting_id)
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS meeting_report_attachments (
+      id VARCHAR(64) PRIMARY KEY,
+      report_id VARCHAR(64) NOT NULL,
+      file_url VARCHAR(500) NOT NULL,
+      file_name VARCHAR(255) NULL,
+      created_at DATETIME NOT NULL,
+      INDEX idx_report_attachments_report (report_id)
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS project_deliverables (
+      id VARCHAR(64) PRIMARY KEY,
+      project_id VARCHAR(64) NOT NULL,
+      title VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      file_url VARCHAR(500) NOT NULL,
+      file_name VARCHAR(255) NULL,
+      locked TINYINT(1) NOT NULL DEFAULT 1,
+      visible_to_client TINYINT(1) NOT NULL DEFAULT 1,
+      created_by VARCHAR(64) NOT NULL,
+      created_at DATETIME NOT NULL,
+      updated_at DATETIME NOT NULL,
+      INDEX idx_deliverables_project (project_id)
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS project_tasks (
+      id VARCHAR(64) PRIMARY KEY,
+      project_id VARCHAR(64) NOT NULL,
+      title VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      status ENUM('TO_DO', 'DOING', 'READY') NOT NULL DEFAULT 'TO_DO',
+      assigned_employee_id VARCHAR(64) NOT NULL,
+      meeting_id VARCHAR(64) NULL,
+      milestone_id VARCHAR(64) NULL,
+      deadline DATETIME NULL,
+      created_by VARCHAR(64) NOT NULL,
+      created_at DATETIME NOT NULL,
+      updated_at DATETIME NOT NULL,
+      INDEX idx_tasks_project (project_id),
+      INDEX idx_tasks_status (status),
+      INDEX idx_tasks_assignee (assigned_employee_id),
+      INDEX idx_tasks_meeting (meeting_id),
+      INDEX idx_tasks_milestone (milestone_id)
+    )
+  `);
+  await ensureColumnIfMissing('project_tasks', 'milestone_id', 'VARCHAR(64) NULL');
 
   const adminRows = await query('SELECT id FROM users WHERE email = ? LIMIT 1', ['admin@ulysse-media.fr']);
   if (!adminRows.length) {
