@@ -4,6 +4,12 @@ import NotificationBell from './NotificationBell';
 
 function MainNav() {
   const { user, logout } = useAuth();
+  const initials = (user?.username || 'U')
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() || '')
+    .join('') || 'U';
 
   return (
     <nav className="fixed top-0 w-full z-50 bg-surface/70 backdrop-blur-xl shadow-sm">
@@ -12,8 +18,8 @@ function MainNav() {
           <Link to="/" className="text-2xl font-extrabold text-blue-900">Ulysse Media</Link>
           <div className="hidden md:flex gap-6">
             <Link className="text-blue-900 border-b-2 border-blue-900 pb-1 tracking-tight font-bold" to="/services">Services</Link>
-            <a className="text-slate-600 hover:text-blue-700 transition-colors duration-200" href="/#portfolio">Portfolio</a>
-            <a className="text-slate-600 hover:text-blue-700 transition-colors duration-200" href="/#about">À propos</a>
+            {!user && <a className="text-slate-600 hover:text-blue-700 transition-colors duration-200" href="/#portfolio">Portfolio</a>}
+            {!user && <a className="text-slate-600 hover:text-blue-700 transition-colors duration-200" href="/#about">À propos</a>}
             <Link className="text-slate-600 hover:text-blue-700 transition-colors duration-200" to="/contact">Contact</Link>
           </div>
         </div>
@@ -31,8 +37,12 @@ function MainNav() {
               <NotificationBell />
 
               <details className="relative">
-                <summary className="list-none cursor-pointer bg-gradient-to-br from-primary to-primary-container text-white px-4 py-2.5 rounded-xl font-semibold shadow-lg">
-                  {user.username}
+                <summary className="list-none cursor-pointer flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-blue-50">
+                  <span className="w-9 h-9 rounded-full bg-blue-700 text-white text-xs font-bold flex items-center justify-center">
+                    {initials}
+                  </span>
+                  <span className="text-blue-800 font-semibold">{user.username}</span>
+                  <span className="material-symbols-outlined text-blue-700 text-[18px]">keyboard_arrow_down</span>
                 </summary>
                 <div className="absolute right-0 mt-2 w-52 bg-white border border-outline-variant/30 rounded-xl shadow-xl overflow-hidden">
                   <Link className="block px-4 py-3 text-sm text-slate-700 hover:bg-surface-container-low" to="/profil">

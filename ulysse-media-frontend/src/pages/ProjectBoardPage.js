@@ -98,6 +98,7 @@ function ProjectBoardPage() {
   const [meetings, setMeetings] = useState([]);
   const [milestones, setMilestones] = useState([]);
   const [deliverables, setDeliverables] = useState([]);
+  const [reviews, setReviews] = useState([]);
   const [paymentProgress, setPaymentProgress] = useState({ paidPercent: 0, paidCents: 0, totalCents: 0 });
   const [permissions, setPermissions] = useState({});
   const [assignees, setAssignees] = useState([]);
@@ -112,6 +113,8 @@ function ProjectBoardPage() {
   const [form, setForm] = useState(EMPTY_FORM);
 
   const [deliverableForm, setDeliverableForm] = useState(EMPTY_DELIVERABLE_FORM);
+  const [reviewForm, setReviewForm] = useState({ rating: 5, comment: '' });
+  const [reviewSaving, setReviewSaving] = useState(false);
   const [confirmState, setConfirmState] = useState({ open: false, title: '', message: '', onConfirm: null, danger: true });
 
   const isBackoffice = user?.role === 'ADMIN' || user?.role === 'EMPLOYE';
@@ -134,6 +137,7 @@ function ProjectBoardPage() {
       setAssignees(boardRes.assignees || []);
       setMilestones(folderRes.milestones || []);
       setDeliverables(folderRes.deliverables || []);
+      setReviews(folderRes.reviews || []);
       setPaymentProgress(folderRes.paymentProgress || { paidPercent: 0, paidCents: 0, totalCents: 0 });
       setPermissions(folderRes.permissions || {});
     } catch (error) {
@@ -334,6 +338,37 @@ function ProjectBoardPage() {
     }
   };
 
+  const submitReview = async () => {
+    if (!permissions.canLeaveReview) {
+      toast.warning('Vous ne pouvez pas laisser un avis pour le moment.');
+      return;
+    }
+    if (!reviewForm.comment.trim() || reviewForm.comment.trim().length < 5) {
+      toast.warning('Merci de saisir un commentaire (minimum 5 caracteres).');
+      return;
+    }
+
+    setReviewSaving(true);
+    try {
+      const res = await authRequest(`/projects/${projectId}/reviews`, token, {
+        method: 'POST',
+        body: JSON.stringify({
+          rating: Number(reviewForm.rating),
+          comment: reviewForm.comment.trim()
+        })
+      });
+
+      setReviews((prev) => [res.review, ...prev]);
+      setPermissions((prev) => ({ ...prev, canLeaveReview: false }));
+      setReviewForm({ rating: 5, comment: '' });
+      toast.success('Merci ! Votre avis a ete enregistre.');
+    } catch (error) {
+      toast.error(error.message);
+    } finally {
+      setReviewSaving(false);
+    }
+  };
+
   const content = (
     <main className="mx-auto w-full max-w-[120rem] space-y-5 px-4 py-6 sm:px-6 lg:px-8">
       <header className="flex flex-wrap items-center justify-between gap-3">
@@ -442,6 +477,52 @@ function ProjectBoardPage() {
                 Progression actuelle: <span className="font-semibold text-slate-800">{paymentProgress.paidPercent || 0}%</span>
                 {' '}
                 ({formatCurrency(paymentProgress.paidCents)} / {formatCurrency(paymentProgress.totalCents)})
+              </div>
+
+              <div className="mt-4 rounded-xl border border-blue-200 bg-white p-4">
+                <h3 className="text-sm font-bold text-blue-900">Avis client</h3>
+                <p className="mt-1 text-xs text-slate-600">
+                  Une fois le projet totalement paye et livre, vous pouvez laisser une note et un commentaire.
+                </p>
+
+                {permissions.canLeaveReview ? (
+                  <div className="mt-3 grid gap-3">
+                    <div className="flex items-center gap-2">
+                      {[1, 2, 3, 4, 5].map((star) => (
+                        <button
+                          key={star}
+                          type="button"
+                          onClick={() => setReviewForm((prev) => ({ ...prev, rating: star }))}
+                          className={`text-2xl ${reviewForm.rating >= star ? 'text-amber-500' : 'text-slate-300'}`}
+                        >
+                          ★
+                        </button>
+                      ))}
+                      <span className="text-xs font-semibold text-slate-600">{reviewForm.rating}/5</span>
+                    </div>
+
+                    <textarea
+                      rows={3}
+                      value={reviewForm.comment}
+                      onChange={(event) => setReviewForm((prev) => ({ ...prev, comment: event.target.value }))}
+                      placeholder="Votre retour sur la collaboration..."
+                      className="rounded-lg border border-outline-variant/30 px-3 py-2 text-sm"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={submitReview}
+                      disabled={reviewSaving}
+                      className="w-fit rounded-lg bg-blue-900 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-800 disabled:opacity-50"
+                    >
+                      {reviewSaving ? 'Envoi...' : 'Envoyer mon avis'}
+                    </button>
+                  </div>
+                ) : (
+                  <p className="mt-3 text-xs text-slate-600">
+                    L'avis devient disponible apres livraison et validation du paiement final.
+                  </p>
+                )}
               </div>
             </section>
           )}
@@ -569,6 +650,26 @@ function ProjectBoardPage() {
               </div>
             )}
           </section>
+
+          {reviews.length > 0 && (
+            <section className="rounded-2xl border border-outline-variant/20 bg-white p-4">
+              <h2 className="text-base font-bold text-on-surface">Avis du projet</h2>
+              <div className="mt-3 space-y-3">
+                {reviews.map((review) => (
+                  <article key={review.id} className="rounded-xl border border-outline-variant/20 bg-surface-container-lowest p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-semibold text-on-surface">{review.clientName || 'Client'}</p>
+                      <p className="text-xs font-semibold text-amber-600">{'★'.repeat(Number(review.rating || 0))}</p>
+                    </div>
+                    <p className="mt-1 text-sm text-on-surface-variant">{review.comment || '-'}</p>
+                    <p className="mt-2 text-[11px] text-on-surface-variant">
+                      {review.createdAt ? new Date(review.createdAt).toLocaleDateString('fr-FR') : ''}
+                    </p>
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
         </>
       )}
 

@@ -452,6 +452,19 @@ function mapDeliverableRow(row) {
   };
 }
 
+function mapProjectReviewRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    clientId: row.client_id,
+    clientName: row.client_name || null,
+    rating: Number(row.rating || 0),
+    comment: row.comment || '',
+    visibleHome: row.visible_home === null ? true : !!row.visible_home,
+    createdAt: row.created_at
+  };
+}
+
 function canAccessProject(user, projectRow) {
   if (!user || !projectRow) return false;
   if (user.role === 'ADMIN') return true;
@@ -1582,6 +1595,173 @@ app.get('/api/contact', auth, authorize('ADMIN'), async (req, res) => {
   return res.json({ contacts });
 });
 
+app.get('/api/reviews/public', async (req, res) => {
+  const limit = Math.min(20, Math.max(1, Number(req.query?.limit || 8)));
+  const rows = await query(
+    `SELECT r.*, u.username AS client_name, s.name AS service_name
+     FROM project_reviews r
+     LEFT JOIN users u ON u.id = r.client_id
+     LEFT JOIN quote_requests q ON q.id = r.project_id
+     LEFT JOIN services s ON s.id = q.service_id
+     WHERE r.visible_home = 1
+     ORDER BY r.created_at DESC
+     LIMIT ${limit}`
+  );
+
+  const reviews = rows.map((row) => ({
+    ...mapProjectReviewRow(row),
+    serviceName: row.service_name || null
+  }));
+  return res.json({ reviews });
+});
+
+app.get('/api/dashboard/admin', auth, authorize('ADMIN'), async (_req, res) => {
+  const [
+    usersTotalRows,
+    employeesRows,
+    clientsRows,
+    projectsRows,
+    activeProjectsRows,
+    completionRows,
+    monthlyRevenueRows,
+    paidRevenueRows,
+    pendingQuotesRows,
+    recentQuotesRows,
+    contactRows
+  ] = await Promise.all([
+    query('SELECT COUNT(*) AS total FROM users'),
+    query('SELECT COUNT(*) AS total FROM users WHERE role = ? AND suspended = 0', ['EMPLOYE']),
+    query('SELECT COUNT(*) AS total FROM users WHERE role = ? AND suspended = 0', ['CLIENT']),
+    query('SELECT COUNT(*) AS total FROM quote_requests'),
+    query("SELECT COUNT(*) AS total FROM quote_requests WHERE project_status IN ('IN_PROGRESS', 'REVIEW', 'DELIVERY_READY')"),
+    query('SELECT AVG(project_completion_percent) AS avg_completion FROM quote_requests'),
+    query(
+      `SELECT DATE_FORMAT(created_at, '%Y-%m') AS period, COALESCE(SUM(amount_cents), 0) AS total
+       FROM payments
+       WHERE status = 'PAID'
+       GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+       ORDER BY period DESC
+       LIMIT 6`
+    ),
+    query("SELECT COALESCE(SUM(amount_cents), 0) AS total FROM payments WHERE status = 'PAID'"),
+    query("SELECT COUNT(*) AS total FROM quote_requests WHERE statut IN ('EN_ATTENTE', 'EN_COURS')"),
+    query(
+      `SELECT q.id, q.service_type, q.statut, q.date_creation, c.username AS client_name
+       FROM quote_requests q
+       LEFT JOIN users c ON c.id = q.client_id
+       ORDER BY q.date_creation DESC
+       LIMIT 8`
+    ),
+    query('SELECT COUNT(*) AS total FROM contact_messages')
+  ]);
+
+  return res.json({
+    metrics: {
+      usersTotal: Number(usersTotalRows[0]?.total || 0),
+      employeesActive: Number(employeesRows[0]?.total || 0),
+      clientsActive: Number(clientsRows[0]?.total || 0),
+      projectsTotal: Number(projectsRows[0]?.total || 0),
+      projectsActive: Number(activeProjectsRows[0]?.total || 0),
+      avgCompletion: Math.round(Number(completionRows[0]?.avg_completion || 0)),
+      totalRevenueCents: Number(paidRevenueRows[0]?.total || 0),
+      pendingQuotes: Number(pendingQuotesRows[0]?.total || 0),
+      contactMessages: Number(contactRows[0]?.total || 0)
+    },
+    monthlyRevenue: monthlyRevenueRows
+      .reverse()
+      .map((row) => ({ period: row.period, totalCents: Number(row.total || 0) })),
+    recentQuotes: recentQuotesRows.map((row) => ({
+      id: row.id,
+      clientName: row.client_name || 'Client',
+      serviceType: row.service_type || 'Service',
+      status: row.statut,
+      createdAt: row.date_creation
+    }))
+  });
+});
+
+app.get('/api/dashboard/employee', auth, authorize('EMPLOYE'), async (req, res) => {
+  const [
+    assignedQuotesRows,
+    activeProjectsRows,
+    taskRows,
+    upcomingMeetingsRows,
+    pendingMilestonesRows,
+    myTasksRows
+  ] = await Promise.all([
+    query('SELECT COUNT(*) AS total FROM quote_requests WHERE assigned_employee_id = ?', [req.user.id]),
+    query(
+      "SELECT COUNT(*) AS total FROM quote_requests WHERE assigned_employee_id = ? AND project_status IN ('IN_PROGRESS', 'REVIEW', 'DELIVERY_READY')",
+      [req.user.id]
+    ),
+    query(
+      `SELECT
+         SUM(CASE WHEN status = 'TO_DO' THEN 1 ELSE 0 END) AS todo_total,
+         SUM(CASE WHEN status = 'DOING' THEN 1 ELSE 0 END) AS doing_total,
+         SUM(CASE WHEN status = 'READY' THEN 1 ELSE 0 END) AS ready_total,
+         COUNT(*) AS total
+       FROM project_tasks
+       WHERE assigned_employee_id = ?`,
+      [req.user.id]
+    ),
+    query(
+      `SELECT id, title, start_date, status
+       FROM meetings
+       WHERE created_by = ? AND start_date >= NOW()
+       ORDER BY start_date ASC
+       LIMIT 6`,
+      [req.user.id]
+    ),
+    query(
+      `SELECT COUNT(*) AS total
+       FROM project_milestones m
+       INNER JOIN quote_requests q ON q.id = m.project_id
+       WHERE q.assigned_employee_id = ? AND m.status IN ('CREATED', 'FAILED')`,
+      [req.user.id]
+    ),
+    query(
+      `SELECT t.id, t.title, t.status, t.deadline, q.id AS project_id, q.service_type
+       FROM project_tasks t
+       INNER JOIN quote_requests q ON q.id = t.project_id
+       WHERE t.assigned_employee_id = ?
+       ORDER BY
+         CASE WHEN t.deadline IS NULL THEN 1 ELSE 0 END,
+         t.deadline ASC,
+         t.updated_at DESC
+       LIMIT 8`,
+      [req.user.id]
+    )
+  ]);
+
+  const taskStats = taskRows[0] || {};
+
+  return res.json({
+    metrics: {
+      assignedQuotes: Number(assignedQuotesRows[0]?.total || 0),
+      activeProjects: Number(activeProjectsRows[0]?.total || 0),
+      tasksTotal: Number(taskStats.total || 0),
+      tasksTodo: Number(taskStats.todo_total || 0),
+      tasksDoing: Number(taskStats.doing_total || 0),
+      tasksReady: Number(taskStats.ready_total || 0),
+      pendingMilestones: Number(pendingMilestonesRows[0]?.total || 0)
+    },
+    upcomingMeetings: upcomingMeetingsRows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      start: row.start_date,
+      status: row.status
+    })),
+    myTasks: myTasksRows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      status: row.status,
+      deadline: row.deadline,
+      projectId: row.project_id,
+      projectName: row.service_type || row.project_id
+    }))
+  });
+});
+
 app.get('/api/quote-requests', auth, async (req, res) => {
   let rows;
   if (req.user.role === 'CLIENT') {
@@ -2279,7 +2459,8 @@ async function buildProjectFolderPayload(project, user) {
     milestonesRows,
     reportsRows,
     deliverablesRows,
-    reportAttachmentsRows
+    reportAttachmentsRows,
+    reviewsRows
   ] = await Promise.all([
     query(
       `SELECT t.*, u.username AS assigned_employee_name
@@ -2327,6 +2508,14 @@ async function buildProjectFolderPayload(project, user) {
        WHERE r.project_id = ?
        ORDER BY a.created_at DESC`,
       [project.id]
+    ),
+    query(
+      `SELECT r.*, u.username AS client_name
+       FROM project_reviews r
+       LEFT JOIN users u ON u.id = r.client_id
+       WHERE r.project_id = ?
+       ORDER BY r.created_at DESC`,
+      [project.id]
     )
   ]);
 
@@ -2359,6 +2548,14 @@ async function buildProjectFolderPayload(project, user) {
       downloadable: !item.locked || canAccessLockedDeliverables
     }));
 
+  const reviews = reviewsRows.map(mapProjectReviewRow);
+  const clientReviewExists = reviews.some((review) => review.clientId === user.id);
+  const canLeaveReview = user.role === 'CLIENT'
+    && user.id === project.client_id
+    && financial.paidPercent >= 100
+    && deliverablesRows.length > 0
+    && !clientReviewExists;
+
   return {
     project: mapProjectSummaryRow(project),
     tasks: tasksRows.map(mapProjectTaskRow),
@@ -2366,13 +2563,15 @@ async function buildProjectFolderPayload(project, user) {
     milestones: milestonesRows.map(mapMilestoneRow),
     reports,
     deliverables,
+    reviews,
     paymentProgress: financial,
     permissions: {
       canManageWorkflow: canManageProjectWorkflow(user, project),
       canManageTasks: canManageProjectTasks(user, project),
       canPayMilestones: user.role === 'CLIENT' && user.id === project.client_id && financial.kickoffPaid,
       canPayKickoff20: user.role === 'CLIENT' && user.id === project.client_id && financial.depositPaid && !financial.kickoffPaid && hasCompletedKickoffMeeting,
-      canAccessLockedDeliverables
+      canAccessLockedDeliverables,
+      canLeaveReview
     }
   };
 }
@@ -2551,6 +2750,60 @@ app.get('/api/projects/:id', auth, async (req, res) => {
 
   const folder = await buildProjectFolderPayload(project, req.user);
   return res.json(folder);
+});
+
+app.post('/api/projects/:id/reviews', auth, authorize('CLIENT'), async (req, res) => {
+  const project = await findProjectById(req.params.id);
+  if (!project) return res.status(404).json({ message: 'Projet introuvable.' });
+  if (project.client_id !== req.user.id) return res.status(403).json({ message: 'Acces interdit.' });
+
+  const rating = Number(req.body?.rating);
+  const comment = String(req.body?.comment || '').trim();
+  if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ message: 'La note doit etre comprise entre 1 et 5.' });
+  }
+  if (comment.length < 5) {
+    return res.status(400).json({ message: 'Le commentaire est requis (min 5 caracteres).' });
+  }
+
+  const alreadyRows = await query(
+    'SELECT id FROM project_reviews WHERE project_id = ? AND client_id = ? LIMIT 1',
+    [project.id, req.user.id]
+  );
+  if (alreadyRows.length) {
+    return res.status(400).json({ message: 'Vous avez deja laisse un avis pour ce projet.' });
+  }
+
+  const deliverableRows = await query(
+    'SELECT id FROM project_deliverables WHERE project_id = ? LIMIT 1',
+    [project.id]
+  );
+  if (!deliverableRows.length) {
+    return res.status(400).json({ message: 'Un livrable doit etre disponible avant de laisser un avis.' });
+  }
+
+  const financial = await getProjectFinancialSummary(project.id);
+  if (financial.paidPercent < 100) {
+    return res.status(400).json({ message: 'L\'avis est disponible apres validation du paiement final.' });
+  }
+
+  const reviewId = createId('rev');
+  await query(
+    `INSERT INTO project_reviews (
+      id, project_id, client_id, rating, comment, visible_home, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [reviewId, project.id, req.user.id, Math.round(rating), comment, 1, mysqlNow()]
+  );
+
+  const rows = await query(
+    `SELECT r.*, u.username AS client_name
+     FROM project_reviews r
+     LEFT JOIN users u ON u.id = r.client_id
+     WHERE r.id = ? LIMIT 1`,
+    [reviewId]
+  );
+
+  return res.status(201).json({ review: mapProjectReviewRow(rows[0]) });
 });
 
 app.post('/api/projects/:id/milestones', auth, authorize('ADMIN', 'EMPLOYE'), async (req, res) => {
@@ -3686,6 +3939,21 @@ async function bootstrapMySql() {
       sujet VARCHAR(120) NOT NULL,
       message TEXT NOT NULL,
       date_creation DATETIME NOT NULL
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS project_reviews (
+      id VARCHAR(64) PRIMARY KEY,
+      project_id VARCHAR(64) NOT NULL,
+      client_id VARCHAR(64) NOT NULL,
+      rating INT NOT NULL,
+      comment TEXT NOT NULL,
+      visible_home TINYINT(1) NOT NULL DEFAULT 1,
+      created_at DATETIME NOT NULL,
+      INDEX idx_reviews_project (project_id),
+      INDEX idx_reviews_client (client_id),
+      INDEX idx_reviews_home (visible_home)
     )
   `);
 

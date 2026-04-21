@@ -35,6 +35,7 @@ import ProjectBoardPage from './pages/ProjectBoardPage';
 import BackOfficeLayout from './components/BackOfficeLayout';
 import ProjectMilestonesPage from './pages/ProjectMilestonesPage';
 import ProjectMeetingsPage from './pages/ProjectMeetingsPage';
+import AdminContactsPage from './pages/AdminContactsPage';
 
 function AuthSocketBridge() {
   const { user, token } = useAuth();
@@ -73,13 +74,29 @@ function ProtectedRoute({ children, roles }) {
   return children;
 }
 
+function RootRoute() {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-on-surface-variant">
+        Verification de la session...
+      </div>
+    );
+  }
+
+  if (user?.role === 'ADMIN') return <Navigate to="/backoffice/admin" replace />;
+  if (user?.role === 'EMPLOYE') return <Navigate to="/backoffice/employe" replace />;
+  return <HomePage />;
+}
+
 function App() {
   return (
     <ToastProvider>
       <AuthSocketBridge />
       <ChatBubble />
     <Routes>
-      <Route path="/" element={<HomePage />} />
+      <Route path="/" element={<RootRoute />} />
       <Route path="/services" element={<ServicesPage />} />
       <Route path="/services/:id" element={<ServiceDetailPage />} />
       <Route path="/contact" element={<ContactPage />} />
@@ -274,6 +291,14 @@ function App() {
           element={(
             <ProtectedRoute roles={['ADMIN']}>
               <AdminPortfolioFormPage />
+            </ProtectedRoute>
+          )}
+        />
+        <Route
+          path="admin/contacts"
+          element={(
+            <ProtectedRoute roles={['ADMIN']}>
+              <AdminContactsPage />
             </ProtectedRoute>
           )}
         />

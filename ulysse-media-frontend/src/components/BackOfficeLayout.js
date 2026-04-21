@@ -8,6 +8,8 @@ function BackOfficeLayout() {
   const isAdmin = user?.role === 'ADMIN';
   const sectionTitle = location.pathname.includes('/utilisateurs')
     ? 'Utilisateurs'
+    : location.pathname.includes('/contacts')
+      ? 'Contacts'
     : location.pathname.includes('/portfolios')
       ? 'Portfolios'
       : location.pathname.includes('/services')
@@ -65,6 +67,13 @@ function BackOfficeLayout() {
             <NavLink to="/backoffice/admin/portfolios" className={navClassName}>
               <span className="material-symbols-outlined">perm_media</span>
               <span>Portfolios</span>
+            </NavLink>
+          )}
+
+          {isAdmin && (
+            <NavLink to="/backoffice/admin/contacts" className={navClassName}>
+              <span className="material-symbols-outlined">contact_mail</span>
+              <span>Contacts</span>
             </NavLink>
           )}
 

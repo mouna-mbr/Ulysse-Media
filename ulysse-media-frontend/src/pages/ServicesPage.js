@@ -1,5 +1,5 @@
-import { Link } from 'react-router-dom';
-import { useEffect, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import { useEffect, useMemo, useState } from 'react';
 import MainNav from '../components/MainNav';
 import { request } from '../api';
 
@@ -44,9 +44,14 @@ function ServiceCard({ service }) {
 }
 
 function ServicesPage() {
+  const location = useLocation();
   const [services, setServices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+
+  const searchParams = new URLSearchParams(location.search);
+  const queryText = (searchParams.get('q') || '').trim().toLowerCase();
+  const queryCategory = (searchParams.get('category') || '').trim().toLowerCase();
 
   useEffect(() => {
     request('/services')
@@ -54,6 +59,18 @@ function ServicesPage() {
       .catch((fetchError) => setError(fetchError.message))
       .finally(() => setLoading(false));
   }, []);
+
+  const filteredServices = useMemo(() => {
+    return services.filter((service) => {
+      const name = String(service.name || '').toLowerCase();
+      const description = String(service.description || '').toLowerCase();
+      const category = String(service.category || '').toLowerCase();
+
+      const textOk = !queryText || name.includes(queryText) || description.includes(queryText) || category.includes(queryText);
+      const categoryOk = !queryCategory || category.includes(queryCategory);
+      return textOk && categoryOk;
+    });
+  }, [services, queryCategory, queryText]);
 
   return (
     <div className="bg-surface min-h-screen text-on-surface">
@@ -63,19 +80,25 @@ function ServicesPage() {
           <p className="text-xs uppercase tracking-[0.24em] font-bold text-secondary mb-4">Catalogue Services</p>
           <h1 className="text-4xl md:text-6xl font-extrabold text-primary tracking-tight">Choisissez votre service</h1>
           <p className="text-secondary mt-4 text-lg">Consultez nos offres, les livrables inclus et des exemples de projets pour lancer votre collaboration avec Ulysse Media.</p>
+          {(queryText || queryCategory) && (
+            <p className="mt-4 text-sm text-on-surface-variant">
+              Filtres actifs: {queryText ? `recherche "${queryText}"` : 'aucune recherche texte'}
+              {queryCategory ? `, categorie "${queryCategory}"` : ''}
+            </p>
+          )}
         </header>
 
         {loading && <p className="text-on-surface-variant">Chargement des services...</p>}
         {error && <p className="text-error">{error}</p>}
 
-        {!loading && !error && services.length === 0 && (
+        {!loading && !error && filteredServices.length === 0 && (
           <div className="rounded-2xl bg-surface-container-low p-8 border border-outline-variant/15">
-            <p className="text-on-surface-variant">Aucun service n'est disponible pour le moment.</p>
+            <p className="text-on-surface-variant">Aucun service ne correspond a votre recherche.</p>
           </div>
         )}
 
         <section className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          {services.map((service) => (
+          {filteredServices.map((service) => (
             <ServiceCard key={service.id} service={service} />
           ))}
         </section>

@@ -1,7 +1,43 @@
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { request } from '../api';
 import MainNav from '../components/MainNav';
 
 function HomePage() {
+  const navigate = useNavigate();
+  const [reviews, setReviews] = useState([]);
+  const [reviewsLoading, setReviewsLoading] = useState(true);
+  const [reviewsError, setReviewsError] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [searchCategory, setSearchCategory] = useState('');
+
+  useEffect(() => {
+    const loadReviews = async () => {
+      setReviewsLoading(true);
+      setReviewsError(false);
+      try {
+        const res = await request('/reviews/public?limit=6');
+        setReviews(res.reviews || []);
+      } catch (_error) {
+        setReviews([]);
+        setReviewsError(true);
+      } finally {
+        setReviewsLoading(false);
+      }
+    };
+
+    loadReviews();
+  }, []);
+
+  const submitSearch = (event) => {
+    event.preventDefault();
+    const params = new URLSearchParams();
+    if (searchText.trim()) params.set('q', searchText.trim());
+    if (searchCategory) params.set('category', searchCategory);
+    const query = params.toString();
+    navigate(query ? `/services?${query}` : '/services');
+  };
+
   return (
     <div className="bg-surface text-on-surface antialiased">
       <MainNav />
@@ -17,23 +53,33 @@ function HomePage() {
               Ulysse Media fusionne marketing stratégique et production multimédia haut de gamme pour transformer votre vision en écosystème digital immersif.
             </p>
 
-            <div className="bg-surface-container-lowest p-2 rounded-2xl shadow-xl flex flex-col md:flex-row gap-2 max-w-2xl border border-outline-variant/15">
+            <form onSubmit={submitSearch} className="bg-surface-container-lowest p-2 rounded-2xl shadow-xl flex flex-col md:flex-row gap-2 max-w-2xl border border-outline-variant/15">
               <div className="flex-1 flex items-center px-4 gap-3 bg-surface-container-low rounded-xl">
                 <span className="material-symbols-outlined text-slate-400">search</span>
-                <input className="bg-transparent border-none focus:ring-0 w-full py-4 text-on-surface placeholder:text-slate-400" placeholder="Quel service recherchez-vous ?" type="text" />
+                <input
+                  className="bg-transparent border-none focus:ring-0 w-full py-4 text-on-surface placeholder:text-slate-400"
+                  placeholder="Quel service recherchez-vous ?"
+                  type="text"
+                  value={searchText}
+                  onChange={(event) => setSearchText(event.target.value)}
+                />
               </div>
               <div className="hidden lg:flex items-center px-4 border-l border-outline-variant/20">
-                <select className="bg-transparent border-none focus:ring-0 font-medium text-slate-600">
-                  <option>Toutes les catégories</option>
-                  <option>Production Vidéo</option>
-                  <option>Design Graphique</option>
-                  <option>Marketing</option>
+                <select
+                  className="bg-transparent border-none focus:ring-0 font-medium text-slate-600"
+                  value={searchCategory}
+                  onChange={(event) => setSearchCategory(event.target.value)}
+                >
+                  <option value="">Toutes les catégories</option>
+                  <option value="Production Video">Production Vidéo</option>
+                  <option value="Design Graphique">Design Graphique</option>
+                  <option value="Marketing">Marketing</option>
                 </select>
               </div>
-              <button className="bg-primary text-white px-8 py-4 rounded-xl font-bold hover:bg-primary-container transition-all" type="button">
+              <button className="bg-primary text-white px-8 py-4 rounded-xl font-bold hover:bg-primary-container transition-all" type="submit">
                 Rechercher
               </button>
-            </div>
+            </form>
           </div>
 
           <div className="flex-1 relative">
@@ -60,13 +106,38 @@ function HomePage() {
       <section className="py-12 bg-surface-container-low" id="portfolio">
         <div className="max-w-7xl mx-auto px-8">
           <p className="text-center text-xs font-bold tracking-[0.2em] text-secondary uppercase mb-8 opacity-60">Ils nous font confiance</p>
-          <div className="flex flex-wrap justify-center items-center gap-12 md:gap-20 opacity-40 grayscale hover:grayscale-0 transition-all duration-500">
-            <div className="h-8 w-32 bg-slate-400 rounded-sm" />
-            <div className="h-8 w-24 bg-slate-400 rounded-sm" />
-            <div className="h-8 w-40 bg-slate-400 rounded-sm" />
-            <div className="h-8 w-28 bg-slate-400 rounded-sm" />
-            <div className="h-8 w-36 bg-slate-400 rounded-sm" />
-          </div>
+
+          {reviewsLoading ? (
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              {[1, 2, 3].map((item) => (
+                <div key={item} className="h-36 animate-pulse rounded-2xl bg-slate-200" />
+              ))}
+            </div>
+          ) : reviews.length > 0 ? (
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+              {reviews.map((review) => (
+                <article key={review.id} className="rounded-2xl border border-outline-variant/20 bg-white p-5 shadow-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-sm font-bold text-on-surface">{review.clientName || 'Client Ulysse'}</p>
+                    <p className="text-xs font-semibold text-amber-600">{'★'.repeat(Number(review.rating || 0))}</p>
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600 line-clamp-4">"{review.comment}"</p>
+                  <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
+                    <span>{review.serviceName || 'Projet multimedia'}</span>
+                    <span>{review.createdAt ? new Date(review.createdAt).toLocaleDateString('fr-FR') : ''}</span>
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : reviewsError ? (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-800">
+              Impossible de charger les avis clients pour le moment.
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-outline-variant/20 bg-white p-5 text-sm text-slate-500">
+              Les avis clients seront bientot affiches ici.
+            </div>
+          )}
         </div>
       </section>
 
@@ -200,8 +271,7 @@ function HomePage() {
                   src="https://lh3.googleusercontent.com/aida-public/AB6AXuAVfgAiWkjX79RqkFc1YSvZ4xH4ygEbMEz6YE4Yretf3iljLoWfqLZ8SQlCgnTvwId-J851O5z4QzXrWkU3tbc8s3SB_sj75xmLsWCnPf0FoU-XOeuW4Cf0bE_dQCz4TYCfH7HdssAWycFLT1NbyX_3oPAVzR0cRquUgs5kKyJ2Iepujew99eCMCbqOzm9IsBnNmKztlxaZYbbRI5aC_Xbb4nk7L9yBFpbu6znGGuFmw5Eq89AZ3Ekc5VIhUl_rfc_ZeOZnuzJCK_aq"
                 />
                 <div>
-                  <p className="font-bold text-white">Marc Ulysse</p>
-                  <p className="text-sm text-primary-fixed/60">Directeur Créatif</p>
+                  <p className="font-bold text-white">Directeur Créatif</p>
                 </div>
               </div>
               <p className="text-white italic leading-relaxed">"Nous ne créons pas seulement du contenu ; nous créons des impressions durables."</p>
