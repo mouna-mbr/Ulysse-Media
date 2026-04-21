@@ -15,6 +15,9 @@ function ProfilePage() {
             <p><span className="font-semibold">Nom :</span> {user?.username || '-'}</p>
             <p><span className="font-semibold">Email :</span> {user?.email || '-'}</p>
             <p><span className="font-semibold">Rôle :</span> {user?.role || '-'}</p>
+            {user?.role === 'EMPLOYE' && (
+              <p><span className="font-semibold">Disponibilite :</span> {user?.disponibilite ? 'Disponible' : 'Non disponible'}</p>
+            )}
           </div>
         </div>
       </main>

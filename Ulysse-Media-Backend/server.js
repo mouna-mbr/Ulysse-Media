@@ -14,6 +14,7 @@ const { parse } = require('csv-parse/sync');
 const { Server: SocketIOServer } = require('socket.io');
 const Stripe = require('stripe');
 const { google } = require('googleapis');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const server = http.createServer(app);
@@ -103,6 +104,53 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || '';
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Ulysse Media <noreply@ulysse-media.com>';
+
+function createMailTransporter() {
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) return null;
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+}
+
+async function sendResetPasswordEmail(toEmail, toName, resetLink) {
+  const transporter = createMailTransporter();
+  if (!transporter) {
+    console.warn('[Email] SMTP non configure — email non envoye. Lien:', resetLink);
+    return;
+  }
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: toEmail,
+    subject: 'Reinitialisation de votre mot de passe — Ulysse Media',
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:32px 24px;">
+        <h2 style="color:#00266f;margin-bottom:8px;">Ulysse Media</h2>
+        <p style="font-size:15px;color:#333;">Bonjour ${toName},</p>
+        <p style="font-size:15px;color:#333;">Vous avez demande la reinitialisation de votre mot de passe.</p>
+        <p style="font-size:15px;color:#333;">Cliquez sur le bouton ci-dessous pour choisir un nouveau mot de passe. Ce lien est valable <strong>1 heure</strong>.</p>
+        <div style="text-align:center;margin:32px 0;">
+          <a href="${resetLink}"
+            style="background:#00266f;color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-size:15px;font-weight:bold;display:inline-block;">
+            Reinitialiser mon mot de passe
+          </a>
+        </div>
+        <p style="font-size:13px;color:#777;">Si vous n'avez pas fait cette demande, ignorez cet email.</p>
+        <p style="font-size:13px;color:#777;">Lien : <a href="${resetLink}">${resetLink}</a></p>
+        <hr style="margin:24px 0;border:none;border-top:1px solid #eee;"/>
+        <p style="font-size:12px;color:#aaa;">© 2026 Ulysse Media. Tous droits reserves.</p>
+      </div>
+    `
+  });
+}
 
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
@@ -725,7 +773,7 @@ async function cancelGoogleMeetingEvent(googleEventId) {
   });
 }
 
-function makeToken(user) {
+function makeToken(user, expiresIn = '8h') {
   return jwt.sign(
     {
       id: user.id,
@@ -734,7 +782,7 @@ function makeToken(user) {
       username: user.username
     },
     JWT_SECRET,
-    { expiresIn: '8h' }
+    { expiresIn }
   );
 }
 
@@ -789,7 +837,7 @@ app.post('/api/auth/register-client', async (req, res) => {
 });
 
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, rememberMe } = req.body;
   if (!email || !password) {
     return res.status(400).json({ message: 'Email et mot de passe requis.' });
   }
@@ -807,7 +855,7 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(401).json({ message: 'Identifiants invalides.' });
   }
 
-  const token = makeToken(user);
+  const token = makeToken(user, rememberMe ? '30d' : '8h');
   return res.json({ token, user: sanitizeUser(user) });
 });
 
@@ -820,6 +868,124 @@ app.get('/api/auth/me', auth, (req, res) => {
       return res.json({ user: sanitizeUser(user) });
     })
     .catch((error) => res.status(500).json({ message: error.message || 'Erreur serveur.' }));
+});
+
+app.post('/api/auth/change-password', auth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'currentPassword et newPassword sont requis.' });
+  }
+  if (String(newPassword).length < 8) {
+    return res.status(400).json({ message: 'Le nouveau mot de passe doit contenir au moins 8 caracteres.' });
+  }
+
+  const user = await findUserById(req.user.id);
+  if (!user) {
+    return res.status(404).json({ message: 'Utilisateur introuvable.' });
+  }
+
+  const valid = await bcrypt.compare(String(currentPassword), user.passwordHash);
+  if (!valid) {
+    return res.status(400).json({ message: 'Mot de passe actuel invalide.' });
+  }
+
+  const nextHash = await bcrypt.hash(String(newPassword), 10);
+  await query('UPDATE users SET password_hash = ? WHERE id = ?', [nextHash, user.id]);
+  return res.json({ message: 'Mot de passe mis a jour.' });
+});
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = String(req.body?.email || '').trim();
+  if (!email) {
+    return res.status(400).json({ message: 'Email requis.' });
+  }
+
+  const user = await findUserByEmail(email);
+  if (user && !user.suspended) {
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+    await query('DELETE FROM password_reset_tokens WHERE user_id = ? AND used_at IS NULL', [user.id]);
+    await query(
+      `INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [createId('prt'), user.id, tokenHash, expiresAt, mysqlNow()]
+    );
+
+    const resetLink = `${FRONTEND_URL}/reinitialiser-mot-de-passe?token=${encodeURIComponent(rawToken)}`;
+    await sendResetPasswordEmail(user.email, user.username, resetLink);
+    return res.json({ message: 'Un email de reinitialisation a ete envoye a votre adresse.' });
+  }
+
+  // Always return the same message to prevent user enumeration
+  return res.json({ message: 'Un email de reinitialisation a ete envoye a votre adresse.' });
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const rawToken = String(req.body?.token || '').trim();
+  const newPassword = String(req.body?.newPassword || '');
+
+  if (!rawToken || !newPassword) {
+    return res.status(400).json({ message: 'token et newPassword sont requis.' });
+  }
+  if (newPassword.length < 8) {
+    return res.status(400).json({ message: 'Le mot de passe doit contenir au moins 8 caracteres.' });
+  }
+
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const rows = await query(
+    `SELECT t.id, t.user_id
+     FROM password_reset_tokens t
+     WHERE t.token_hash = ? AND t.used_at IS NULL AND t.expires_at > NOW()
+     ORDER BY t.created_at DESC
+     LIMIT 1`,
+    [tokenHash]
+  );
+
+  if (!rows.length) {
+    return res.status(400).json({ message: 'Lien de reinitialisation invalide ou expire.' });
+  }
+
+  const tokenRow = rows[0];
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await query('UPDATE users SET password_hash = ? WHERE id = ?', [passwordHash, tokenRow.user_id]);
+  await query('UPDATE password_reset_tokens SET used_at = ? WHERE id = ?', [mysqlNow(), tokenRow.id]);
+
+  return res.json({ message: 'Mot de passe reinitialise avec succes.' });
+});
+
+app.patch('/api/profile', auth, async (req, res) => {
+  const user = await findUserById(req.user.id);
+  if (!user) {
+    return res.status(404).json({ message: 'Utilisateur introuvable.' });
+  }
+
+  const { username, tel, address, disponibilite } = req.body || {};
+  const nextUser = { ...user };
+
+  if (typeof username === 'string' && username.trim()) nextUser.username = username.trim();
+  if (typeof tel === 'string') nextUser.tel = tel.trim();
+  if (typeof address === 'string') nextUser.address = address.trim();
+  if (nextUser.role === 'EMPLOYE' && typeof disponibilite === 'boolean') {
+    nextUser.disponibilite = disponibilite;
+  }
+
+  await query(
+    `UPDATE users
+     SET username = ?, tel = ?, address = ?, disponibilite = ?
+     WHERE id = ?`,
+    [
+      nextUser.username,
+      nextUser.tel || null,
+      nextUser.address || null,
+      typeof nextUser.disponibilite === 'boolean' ? (nextUser.disponibilite ? 1 : 0) : null,
+      nextUser.id
+    ]
+  );
+
+  const token = makeToken(nextUser);
+  return res.json({ user: sanitizeUser(nextUser), token });
 });
 
 async function getPortfolioByServiceId(serviceId) {
@@ -3954,6 +4120,20 @@ async function bootstrapMySql() {
       INDEX idx_reviews_project (project_id),
       INDEX idx_reviews_client (client_id),
       INDEX idx_reviews_home (visible_home)
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id VARCHAR(64) PRIMARY KEY,
+      user_id VARCHAR(64) NOT NULL,
+      token_hash VARCHAR(128) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      used_at DATETIME NULL,
+      created_at DATETIME NOT NULL,
+      INDEX idx_reset_user (user_id),
+      INDEX idx_reset_hash (token_hash),
+      INDEX idx_reset_expires (expires_at)
     )
   `);
 

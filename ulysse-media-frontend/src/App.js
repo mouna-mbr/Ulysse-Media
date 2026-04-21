@@ -9,6 +9,8 @@ import PaymentSuccessPage from './pages/PaymentSuccessPage';
 import HomePage from './pages/HomePage';
 import ContactPage from './pages/ContactPage';
 import SignInPage from './pages/SignInPage';
+import ForgotPasswordPage from './pages/ForgotPasswordPage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
 import RegisterPage from './pages/RegisterPage';
 import AdminUsersPage from './pages/AdminUsersPage';
 import AddUsersPage from './pages/AddUsersPage';
@@ -16,6 +18,7 @@ import AdminDashboardPage from './pages/AdminDashboardPage';
 import EmployeeDashboardPage from './pages/EmployeeDashboardPage';
 import ProfilePage from './pages/ProfilePage';
 import SettingsPage from './pages/SettingsPage';
+import BackOfficeSettingsPage from './pages/BackOfficeSettingsPage';
 import ServicesPage from './pages/ServicesPage';
 import ServiceDetailPage from './pages/ServiceDetailPage';
 import QuoteRequestPage from './pages/QuoteRequestPage';
@@ -90,6 +93,14 @@ function RootRoute() {
   return <HomePage />;
 }
 
+function SettingsRoute() {
+  const { user } = useAuth();
+  if (user?.role === 'ADMIN' || user?.role === 'EMPLOYE') {
+    return <Navigate to="/backoffice/parametres" replace />;
+  }
+  return <SettingsPage />;
+}
+
 function App() {
   return (
     <ToastProvider>
@@ -101,6 +112,8 @@ function App() {
       <Route path="/services/:id" element={<ServiceDetailPage />} />
       <Route path="/contact" element={<ContactPage />} />
       <Route path="/connexion" element={<SignInPage />} />
+      <Route path="/mot-de-passe-oublie" element={<ForgotPasswordPage />} />
+      <Route path="/reinitialiser-mot-de-passe" element={<ResetPasswordPage />} />
       <Route path="/inscription" element={<RegisterPage />} />
       <Route
         path="/client/devis/:serviceId"
@@ -194,7 +207,7 @@ function App() {
         path="/parametres"
         element={(
           <ProtectedRoute>
-            <SettingsPage />
+            <SettingsRoute />
           </ProtectedRoute>
         )}
       />
@@ -371,6 +384,14 @@ function App() {
           element={(
             <ProtectedRoute roles={['EMPLOYE']}>
               <EmployeeDashboardPage />
+            </ProtectedRoute>
+          )}
+        />
+        <Route
+          path="parametres"
+          element={(
+            <ProtectedRoute roles={['ADMIN', 'EMPLOYE']}>
+              <BackOfficeSettingsPage />
             </ProtectedRoute>
           )}
         />

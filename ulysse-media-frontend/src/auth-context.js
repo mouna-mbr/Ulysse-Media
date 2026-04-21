@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { authRequest, request } from './api';
 
 const AuthContext = createContext(null);
@@ -43,10 +43,10 @@ export function AuthProvider({ children }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const login = async (email, password) => {
+  const login = async (email, password, rememberMe = false) => {
     const result = await request('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password })
+      body: JSON.stringify({ email, password, rememberMe })
     });
 
     setToken(result.token);
@@ -54,6 +54,17 @@ export function AuthProvider({ children }) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ token: result.token }));
     return result.user;
   };
+
+  const applyAuthSnapshot = useCallback((nextUser, nextToken) => {
+    const effectiveToken = nextToken || token;
+    if (effectiveToken) {
+      setToken(effectiveToken);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ token: effectiveToken }));
+    }
+    if (nextUser) {
+      setUser(nextUser);
+    }
+  }, [token]);
 
   const registerClient = async (payload) => {
     const result = await request('/auth/register-client', {
@@ -74,8 +85,8 @@ export function AuthProvider({ children }) {
   };
 
   const value = useMemo(
-    () => ({ token, user, loading, login, registerClient, logout }),
-    [token, user, loading]
+    () => ({ token, user, loading, login, registerClient, logout, applyAuthSnapshot }),
+    [token, user, loading, applyAuthSnapshot]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

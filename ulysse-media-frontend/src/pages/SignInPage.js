@@ -7,7 +7,7 @@ function SignInPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
   const toast = useToast();
-  const [form, setForm] = useState({ email: '', password: '' });
+  const [form, setForm] = useState({ email: '', password: '', rememberMe: true });
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
@@ -17,7 +17,7 @@ function SignInPage() {
     setLoading(true);
     setError('');
     try {
-      const user = await login(form.email, form.password);
+      const user = await login(form.email, form.password, !!form.rememberMe);
       toast.success(`Bienvenue, ${user.username} !`);
       if (user.role === 'ADMIN') {
         navigate('/backoffice/admin');
@@ -115,7 +115,7 @@ function SignInPage() {
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <label className="block text-sm font-semibold text-on-surface" htmlFor="password">Mot de passe</label>
-                  <a className="text-xs font-semibold text-primary hover:text-primary-container transition-colors" href="#forgot">Mot de passe oublié ?</a>
+                  <Link className="text-xs font-semibold text-primary hover:text-primary-container transition-colors" to="/mot-de-passe-oublie">Mot de passe oublié ?</Link>
                 </div>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
@@ -138,7 +138,13 @@ function SignInPage() {
               </div>
 
               <div className="flex items-center">
-                <input className="w-4 h-4 text-primary bg-surface-container-highest border-none rounded focus:ring-primary focus:ring-offset-0" id="remember" type="checkbox" />
+                <input
+                  className="w-4 h-4 text-primary bg-surface-container-highest border-none rounded focus:ring-primary focus:ring-offset-0"
+                  id="remember"
+                  type="checkbox"
+                  checked={!!form.rememberMe}
+                  onChange={(event) => setForm((prev) => ({ ...prev, rememberMe: event.target.checked }))}
+                />
                 <label className="ml-2 text-sm text-on-surface-variant select-none" htmlFor="remember">Se souvenir de moi pendant 30 jours</label>
               </div>
 

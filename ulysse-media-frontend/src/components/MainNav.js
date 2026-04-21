@@ -4,6 +4,7 @@ import NotificationBell from './NotificationBell';
 
 function MainNav() {
   const { user, logout } = useAuth();
+  const settingsPath = user?.role === 'ADMIN' || user?.role === 'EMPLOYE' ? '/backoffice/parametres' : '/parametres';
   const initials = (user?.username || 'U')
     .split(' ')
     .filter(Boolean)
@@ -48,7 +49,7 @@ function MainNav() {
                   <Link className="block px-4 py-3 text-sm text-slate-700 hover:bg-surface-container-low" to="/profil">
                     Voir profil
                   </Link>
-                  <Link className="block px-4 py-3 text-sm text-slate-700 hover:bg-surface-container-low" to="/parametres">
+                  <Link className="block px-4 py-3 text-sm text-slate-700 hover:bg-surface-container-low" to={settingsPath}>
                     Voir paramètres
                   </Link>
                   {user.role === 'CLIENT' && (

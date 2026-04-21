@@ -8,6 +8,8 @@ function BackOfficeLayout() {
   const isAdmin = user?.role === 'ADMIN';
   const sectionTitle = location.pathname.includes('/utilisateurs')
     ? 'Utilisateurs'
+    : location.pathname.includes('/parametres')
+      ? 'Parametres'
     : location.pathname.includes('/contacts')
       ? 'Contacts'
     : location.pathname.includes('/portfolios')
@@ -102,10 +104,10 @@ function BackOfficeLayout() {
         </nav>
 
         <div className="mt-auto border-t border-outline-variant/30 pt-4 space-y-2">
-          <button type="button" className={`${passiveNavClass} w-full text-left`}>
+          <NavLink to="/backoffice/parametres" className={navClassName}>
             <span className="material-symbols-outlined">settings</span>
             <span>Settings</span>
-          </button>
+          </NavLink>
           <button
             type="button"
             className="w-full rounded-xl px-4 py-3 text-sm font-semibold bg-gradient-to-br from-primary to-primary-container text-white"
